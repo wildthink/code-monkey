@@ -97,8 +97,7 @@ reverts.
 
 - [`GUIDE.md`](GUIDE.md) — the full reference: every command, flag, and the schema
 - [`SKILL.md`](SKILL.md) — the agent-facing skill
-- [`ROADMAP.md`](ROADMAP.md) — where this is going
-- [`Archive/`](Archive/) — the pre-SQLite generation, kept for reference
+- [`ROADMAP.md`](ROADMAP.md) — where this is going, and what was deliberately left undone
 
 ## License
 
