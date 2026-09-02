@@ -1,0 +1,3 @@
+#!/bin/sh
+# See hooks/_reindex.sh. Installed by `make hooks`.
+exec "$(dirname "$0")/_reindex.sh"
