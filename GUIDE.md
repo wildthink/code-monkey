@@ -174,6 +174,118 @@ on `schema_version`, not output formatting details.
 
 ---
 
+## The write model
+
+`clip`, `move`, and `rename` all write at byte offsets taken from the index.
+Everything below follows from that one fact, and is worth reading once before
+using any of them.
+
+### Where a declaration begins
+
+`decl_offset` points at the declaration's **first token onward**. Attributes are
+tokens of the node, so `@MainActor` and friends are part of the declaration.
+Comments never are — their text is stored in `doc_comments` and `directives`
+instead, and the bytes above a decl belong to no declaration at all.
+
+```swift
+/// Doc for note.              <- doc_comments
+//# ai:invariant: returns one  <- directives
+@MainActor                     <- decl_offset starts here
+func note() -> Int { 1 }       <- ...through here
+```
+
+That single rule explains what each write addresses:
+
+| Operation | Byte range it writes |
+|---|---|
+| `clip --paste-replacing` | the declaration only |
+| `clip --paste-replacing --with-doc` | comment block + declaration |
+| `clip --paste-after` | inserts at the declaration's last byte |
+| `clip --paste-before` | inserts above the comment block |
+| `clip --cut`, `move` | comment block + declaration, separators collapsed |
+
+`--paste-before` and `--cut` need the commentary, which `decl_offset` cannot give
+them, so they re-derive it from the source: `leadingBlockStart` climbs contiguous
+`//` lines upward from the declaration's own line. This is deliberate rather than
+a workaround — it also keeps them correct regardless of what the extractor decides
+a declaration's bytes are.
+
+The scan is textual. A blank line between a doc comment and its declaration breaks
+the association, and the comment is then left behind.
+
+### Indentation
+
+A declaration's stored bytes begin at the declaration, **not** at the start of its
+line, so the whitespace positioning it is not part of what these commands see.
+That is why `--paste-replacing` never has to think about indentation, and why
+inserting does:
+
+- The **paste** modes re-indent stdin's *first line* to match the neighbouring
+  declaration and leave its interior alone, matching same-depth insertion.
+- **`move`** re-indents the *whole block*, stripping the source's indent prefix
+  per line and applying the destination's. A move usually changes nesting depth —
+  that is the point of it — so first-line-only would misalign the body. Nesting
+  inside the block is preserved.
+
+### Round trips
+
+Two contracts hold exactly, and both are covered by tests:
+
+```bash
+code-monkey clip Box.note --cut > removed.swift
+code-monkey clip Box.tail --paste-before < removed.swift   # byte-identical
+```
+
+`--cut` echoes the block from its first *content* byte rather than the line start,
+because the paste modes supply the indent themselves; a payload carrying its own
+indentation would come back double-indented. Moving a declaration out of a type
+and back likewise returns the original text.
+
+### Three write guards
+
+Writing at index-derived offsets has three failure modes worth refusing outright.
+
+**Stale index.** An edit made outside these commands — a `sed`, an editor save, a
+`git checkout` — shifts every later offset while the index still points at the old
+ones. A shifted offset that happens to stay in range passes a bounds check and
+splices into the middle of a token, corrupting the file silently. So the file is
+compared against the SHA-256 recorded at index time:
+
+```
+Sources/App/Box.swift changed since it was indexed — refusing to write at stale
+offsets. Run `code-monkey index` and retry.
+```
+
+There is no override; `index` is the remedy and it is incremental. This does not
+make outside edits safe — it makes them loud.
+
+**Empty payload.** A paste mode given empty or whitespace-only stdin refuses. An
+empty payload is never a real edit — it is a failed `cat`, a closed pipe, or a
+typo'd heredoc — and writing it silently deletes the declaration. Pass `--cut` to
+delete deliberately.
+
+**Duplicated doc.** Because a declaration's bytes stop below its comment block, a
+`--paste-replacing` payload carrying its own doc comment lands *underneath* the
+existing one rather than overwriting it. `clip` refuses when stdin starts with a
+comment and the declaration already has a block; `--with-doc` is the explicit path,
+and is also the only way to edit a doc comment through `clip`. A doc-carrying
+payload for a declaration with no block is allowed — that legitimately adds one.
+
+### What is not checked
+
+These are positional writes at stable addresses, not AST operations.
+
+- **The payload is never parsed.** A replacement that redeclares a sibling
+  surfaces as `invalid redeclaration` from the compiler, not from `clip`. Replace
+  the *narrowest* declaration that covers what you are changing.
+- **`move` does not check the destination is legal.** Moving a `private` member
+  out of its type, or a method that uses `self`, produces code that does not
+  compile. It relocates bytes; whether they belong there is your call.
+- **`rename` changes the declaration only.** References are reported with
+  confidence grades and never rewritten — see below for why.
+
+---
+
 ## Commands
 
 ### `code` — readable outlines, dialled up
@@ -544,18 +656,126 @@ keyword on a scoped import (`import struct Foo.Bar` → `struct`).
 Nothing is deduplicated — two files importing the same module are two rows,
 because "which files reach for this" is the question being asked.
 
-### `clip` — write-only replace by decl_id
+### `clip` — write-only replace, insert, or cut by decl_id
 
 ```bash
 code-monkey clip "UserService.createUser(email:String)" --paste-replacing < new.swift
 code-monkey clip createUser --file Sources/UserService.swift --paste-replacing < new.swift
+code-monkey clip createUser --paste-after < sibling.swift
+code-monkey clip createUser --paste-before < sibling.swift
+code-monkey clip createUser --cut > removed.swift
 ```
 
-`clip` only writes — `--paste-replacing` is required. To read a decl first,
-use `get --fields body`. Resolves the same way as `get`: exact `decl_id`,
-then name/signature substring; `--file` narrows when a name matches in more
-than one file. `--paste-replacing` swaps the matched decl for stdin and
-auto-refreshes the index for that file.
+`clip` only writes — exactly one of `--paste-replacing`, `--paste-after`,
+`--paste-before`, or `--cut` is required. To read a decl first, use `get --fields body`. Resolves the same way
+as `get`: exact `decl_id`, then name/signature substring; `--file` narrows when
+a name matches in more than one file. Either mode auto-refreshes the index for
+the touched file.
+
+Because the exact tier wins, a container name resolves to the type itself
+rather than to its members — `clip Box --paste-replacing` replaces the whole of
+`Box`, bodies included, so stdin must carry the entire declaration.
+
+**`--paste-replacing`** swaps the matched decl's bytes for stdin, verbatim. Those
+bytes stop below the decl's comment block, so stdin should carry the declaration
+*without* its doc comment. If stdin starts with a comment and the decl already has
+one, `clip` refuses rather than leaving both:
+
+```
+note() already has a comment block and stdin starts with one — replacing would
+leave both. Drop the comment from stdin, or pass --with-doc to replace the block too.
+```
+
+**`--with-doc`** (with `--paste-replacing` only) widens the replacement to cover
+the comment block, so stdin carries doc, directives, and declaration together.
+That is the way to edit a decl's doc comment through `clip`.
+
+**`--paste-after`** inserts stdin as a new declaration immediately following the
+matched one, in the same scope — after a member it lands inside the container,
+after a top-level decl it lands at top level. A declaration's stored bytes begin
+at the declaration and not at the start of its line, so the indentation that
+positions it is not part of what `clip` sees; `--paste-after` reads the indent of
+the decl it follows and applies it to the first line of stdin, leaving stdin's
+own interior indentation alone. It supplies its own blank-line separator and
+trims trailing newlines from stdin so they don't stack.
+
+**`--paste-before`** is the mirror of `--paste-after`, with one difference that
+matters: it inserts *above the decl's comment block*, not between a declaration
+and the doc comment describing it.
+
+**`--cut`** deletes the declaration together with the comment block introducing
+it, and echoes the removed source to **stdout** so the deletion is recoverable.
+It collapses the blank-line separators around the hole, so cutting the first or
+last declaration in a file doesn't leave the file opening or ending on a blank
+line.
+
+```bash
+# add a sibling method inside Box, indented to match
+printf 'func added() -> Int { 2 }' | code-monkey clip "Box.note()" --paste-after
+
+# delete it again, keeping the source
+code-monkey clip "Box.note()" --cut > removed.swift
+
+# put it back exactly as it was
+code-monkey clip "Box.tail()" --paste-before < removed.swift
+```
+
+That round trip is exact — see [The write model](#the-write-model) for why the
+echoed payload starts where it does.
+
+**Status output.** All four modes write their confirmation to **stderr**, leaving
+stdout for payload. Only `--cut` produces payload, so `clip … --cut > out.swift`
+captures exactly the removed source.
+
+**Guards.** `clip` refuses a stale index, an empty payload, and a doc-carrying
+payload for a declaration that already has one. All three are described under
+[The write model](#three-write-guards).
+
+### `move` — relocate a declaration
+
+```bash
+code-monkey move "Box.note()" --to Sources/Other.swift                     # append at end
+code-monkey move "Box.note()" --to Sources/Other.swift --after "Crate.tag" # place it precisely
+code-monkey move helper --to Sources/Same.swift --after other              # reorder within a file
+```
+
+Moves the declaration **and its comment block** — the `///` docs and `//# ai:`
+directives that introduce it travel with it. The source is closed up the way
+`clip --cut` closes it: separators collapse, and a decl that was the last member
+of its type doesn't leave a blank line dangling before the closing brace.
+
+**The block is re-indented to its new depth**, preserving the nesting inside it,
+so a moved function keeps the shape of its own body. Moving a decl out and back
+returns the original text. See [The write model](#indentation).
+
+Both files are hash-checked before either is written, the same guard `clip` uses.
+`--after` is resolved in the destination file, and naming the decl being moved is
+refused. `move` does not check that the declaration is legal at its destination.
+
+### `rename` — rename a declaration, report its references
+
+```bash
+code-monkey rename "Box.note()" --to observe
+```
+
+```
+renamed Box.note() to `observe` in Sources/A.swift
+2 sites may reference `note` — none were changed:
+  [medium] Sources/B.swift:3  usesIt(b:Box) via b
+  [medium] Sources/B.swift:4  alsoUses(b:Box) via b
+Each is a syntactic guess. Fix them with `clip`, or use `swiftmind` for semantic answers.
+```
+
+`--to` must be a bare Swift identifier. The rename touches the declared name and
+nothing else; the status line goes to stderr and the reference report to stdout.
+
+**References are reported, never rewritten** — deliberately, for two concrete
+reasons. `call_sites` records a line number and no byte offset, so there is
+nothing to patch precisely. And every edge is a graded syntactic guess: rewriting
+a `medium` or `low` one renames unrelated code that merely shares a name. A
+correct automatic update needs a semantic index — that is `swiftmind`'s job.
+
+So the workflow is: rename, read the graded list, fix each site with `clip`.
 
 ### `file` — sandbox-escape ops
 
@@ -628,10 +848,34 @@ code-monkey doctor
 code-monkey doctor --json
 ```
 
-Reports running executable, checkout build path, project root, index path,
-schema version, WAL mode, audit destination, freshness, and actionable
-warnings. In repository checkout, it warns when `code-monkey` on `PATH`
-differs from `.build/debug/code-monkey`.
+Reports the provenance of the binary that is running, the project root, index
+path, schema version, WAL mode, audit destination, freshness, and actionable
+warnings.
+
+Provenance is the part worth explaining. `doctor` prints, for the running
+executable, the checkout it is being run against, and the `code-monkey-mcp`
+peer beside it:
+
+```
+built_from=/path/to/checkout commit=abc1234 build=#20
+```
+
+and warns whenever those disagree. More than one repository can build a binary
+of this name, and when the wrong one is on `PATH` the symptoms are indirect —
+a schema mismatch, or an MCP tool list that does not match the CLI — so the
+question "which checkout produced this?" is worth a direct answer.
+
+Two things make that answer possible. `BuildInfo` is committed, so the commit
+it names describes the source and not the working copy that ran the compiler;
+`make install` therefore writes a manifest beside the binaries recording
+`source_root`, `commit`, `build_seq` and `build_date`. And staleness is decided
+by build sequence, never by modification time: `make install` copies, and a
+copy always lands with a fresh mtime, so a date comparison would report every
+stale install as current. The checkout's own identity is read out of
+`BuildInfo.swift` rather than by executing `.build/debug/code-monkey` — a
+diagnostic should not depend on the binary it is diagnosing being runnable.
+
+`doctor` identifies the binary actually running. It does not scan `PATH`.
 
 ---
 
