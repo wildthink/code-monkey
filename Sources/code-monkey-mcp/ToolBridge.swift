@@ -221,10 +221,14 @@ struct ToolBridge: Sendable {
 
         var stdin: String?
         if let key = policy.stdinArgument(for: name) {
-            guard let text = arguments[key.key]?.stringValue else {
+            // `isRequired` is the policy's to state and was previously ignored here: a payload
+            // can be conditional on another argument, as `clip`'s is — `cut` reads nothing.
+            //# ai:invariant: an optional payload absent from the call is not an error
+            if let text = arguments[key.key]?.stringValue {
+                stdin = text
+            } else if key.isRequired {
                 throw ServerError(message: "\(name) requires '\(key.key)'")
             }
-            stdin = text
         }
         return (argv, stdin)
     }

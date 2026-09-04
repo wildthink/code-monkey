@@ -1471,7 +1471,6 @@ struct BridgeTests {
     @Test func serverDrivenFlagsAreHidden() throws {
         #expect(try Self.schema("code_monkey_index")["call_sites"] == nil)
         #expect(try Self.schema("code_monkey_index")["no_call_sites"] == nil)
-        #expect(try Self.schema("code_monkey_clip")["paste_replacing"] == nil)
         // `--format json` is injected, so offering the option would advertise a dead knob.
         #expect(try Self.schema("code_monkey_get")["format"] == nil)
         for tool in ["code_monkey_get", "code_monkey_calls", "code_monkey_index"] {
@@ -1480,11 +1479,16 @@ struct BridgeTests {
     }
 
     /// Verified here rather than by calling it: `clip` rewrites source in place.
-    @Test func clipSendsItsBodyOnStdinAndForcesTheWriteFlag() throws {
+    ///
+    /// The mode is the client's to choose. It was once injected, back when replacement was the
+    /// only thing `clip` could do; with four mutually exclusive modes an injected one would
+    /// both hide the other three and collide with whichever the client picked.
+    @Test func clipSendsItsBodyOnStdinAndCarriesTheClientsMode() throws {
         let (argv, stdin) = try Self.bridge().invocation(
             for: "code_monkey_clip",
             arguments: ["pattern": .string("Walker.relPath"),
                         "file": .string("Sources/code-monkey/Walker.swift"),
+                        "paste_replacing": .bool(true),
                         "new_body": .string("func relPath() {}")])
         #expect(argv.first == "clip")
         #expect(argv.contains("Walker.relPath"))
@@ -1493,6 +1497,16 @@ struct BridgeTests {
         #expect(stdin == "func relPath() {}")
         // The body is a payload, never an argv token.
         #expect(!argv.contains("func relPath() {}"))
+    }
+
+    /// A mode the old policy could never express.
+    @Test func clipCanCutWithoutAPayload() throws {
+        let (argv, stdin) = try Self.bridge().invocation(
+            for: "code_monkey_clip",
+            arguments: ["pattern": .string("Walker.relPath"), "cut": .bool(true)])
+        #expect(argv.contains("--cut"))
+        #expect(!argv.contains("--paste-replacing"), "the client asked to cut, not to replace")
+        #expect(stdin == nil || stdin?.isEmpty == true)
     }
 
     @Test func fileWriteRoutesContentToStdin() throws {
@@ -1601,5 +1615,438 @@ struct BridgeProseTests {
         }
         // `version` declares no abstract, so it falls back to its command name rather than "".
         #expect(try Self.description("code_monkey_version") == "version")
+    }
+}
+
+@Suite struct ClipTests {
+
+    /// `clip` resolves in two tiers. Before the exact tier existed, a single
+    /// substring query matched a type *and* all of its members, so no container
+    /// could ever be replaced.
+    @Test func exactDeclIdBeatsItsOwnMembers() async throws {
+        let tmp = try makeClipProject()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let db = try await indexed(tmp)
+
+        let rows = try await ClipCmd.resolveTarget(pattern: "Box", fileFilter: nil, db: db)
+        #expect(rows.count == 1)
+        #expect(rows.first?.string("decl_id") == "Box")
+    }
+
+    /// The fuzzy tier still runs when nothing matches the handle exactly.
+    @Test func fuzzyTierRunsOnlyWhenExactFindsNothing() async throws {
+        let tmp = try makeClipProject()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let db = try await indexed(tmp)
+
+        let rows = try await ClipCmd.resolveTarget(pattern: "standalon", fileFilter: nil, db: db)
+        #expect(rows.count == 1)
+        #expect(rows.first?.string("decl_id") == "standalone()")
+    }
+
+    /// A genuine collision must stay ambiguous — the caller refuses to write.
+    @Test func collidingDeclIdsStayAmbiguousUntilFiltered() async throws {
+        let tmp = try makeClipProject()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let db = try await indexed(tmp)
+
+        let both = try await ClipCmd.resolveTarget(pattern: "String.shared()", fileFilter: nil, db: db)
+        #expect(both.count == 2)
+
+        let one = try await ClipCmd.resolveTarget(
+            pattern: "String.shared()", fileFilter: "Sources/B.swift", db: db
+        )
+        #expect(one.count == 1)
+        #expect(one.first?.string("file_path") == "Sources/B.swift")
+    }
+
+    /// An inserted member has to be re-indented: a decl's stored bytes start at the
+/// declaration, not at the start of its line.
+@Test func insertedDeclInheritsTheIndentOfTheDeclItFollows() throws {
+        let src = "struct Box {\n    func note() -> Int { 1 }\n}\nfunc top() -> Int { 1 }\n"
+        let data = Data(src.utf8)
+
+        let member = try #require(src.range(of: "func note"))
+        let memberOffset = src.distance(from: src.startIndex, to: member.lowerBound)
+        #expect(ClipCmd.lineIndent(of: data, at: memberOffset) == "    ")
+
+        let top = try #require(src.range(of: "func top"))
+        let topOffset = src.distance(from: src.startIndex, to: top.lowerBound)
+        #expect(ClipCmd.lineIndent(of: data, at: topOffset) == "")
+    }
+
+    @Test func lineIndentStopsAtTheFirstNonWhitespaceByte() {
+        let data = Data("\tfunc tabbed() {}\n".utf8)
+        #expect(ClipCmd.lineIndent(of: data, at: 1) == "\t")
+        // Offset past the indent must not walk back over the decl text itself.
+        #expect(ClipCmd.lineIndent(of: data, at: 6) == "\t")
+    }
+
+    /// `--paste-after` supplies its own separator, so stdin must not stack another.
+    @Test func trailingNewlinesAreTrimmedBeforeInsertion() {
+        let trimmed = ClipCmd.trimmingTrailingNewlines(Data("func f() {}\n\r\n\n".utf8))
+        #expect(String(decoding: trimmed, as: UTF8.self) == "func f() {}")
+
+        // Interior newlines and a body with no trailing newline both survive intact.
+        let multi = ClipCmd.trimmingTrailingNewlines(Data("a\n\nb".utf8))
+        #expect(String(decoding: multi, as: UTF8.self) == "a\n\nb")
+        #expect(ClipCmd.trimmingTrailingNewlines(Data()).isEmpty)
+    }
+
+    /// decl_offset can point *inside* the comment block: Extractor advances attrStart
+    /// to each plain `//` line in the leading trivia. The scan must climb from there.
+    @Test func leadingBlockStartClimbsTheWholeCommentBlock() throws {
+        let src = "struct Box {\n    /// doc\n    //# ai:x: y\n    // plain\n    func f() {}\n}\n"
+        let data = Data(src.utf8)
+        let off = { (needle: String) in src.distance(from: src.startIndex, to: src.range(of: needle)!.lowerBound) }
+        let doc = off("/// doc")
+
+        // From the decl itself, and from a decl_offset dragged into the block.
+        #expect(ClipCmd.leadingBlockStart(of: data, at: off("func f")) == doc)
+        #expect(ClipCmd.leadingBlockStart(of: data, at: off("// plain")) == doc)
+
+        // A decl with nothing above it resolves to its own first content byte.
+        let bare = Data("struct Box {\n    func f() {}\n}\n".utf8)
+        #expect(ClipCmd.leadingBlockStart(of: bare, at: 17) == 17)
+    }
+
+    /// A blank line above and below the cut decl must not both survive it.
+    @Test func cutRangeLeavesNoDoubledOrEdgeBlankLine() throws {
+        func cut(_ src: String, _ needle: String) -> String {
+            let data = Data(src.utf8)
+            let start = src.distance(from: src.startIndex, to: src.range(of: needle)!.lowerBound)
+            let decl = String(src[src.range(of: needle)!.lowerBound...]).prefix(while: { $0 != "\n" })
+            var d = data
+            d.replaceSubrange(ClipCmd.cutRange(in: data, declOffset: start, declLength: decl.utf8.count), with: Data())
+            return String(decoding: d, as: UTF8.self)
+        }
+        // First decl: its doc goes too, and the file must not open on a blank line.
+        #expect(cut("/// d\nfunc a() {}\n\nfunc b() {}\n", "func a") == "func b() {}\n")
+        // Last decl: the separator above is the one to drop.
+        #expect(cut("func a() {}\n\nfunc b() {}\n", "func b") == "func a() {}\n")
+        // Middle decl: exactly one separator survives.
+        #expect(cut("func a() {}\n\nfunc b() {}\n\nfunc c() {}\n", "func b") == "func a() {}\n\nfunc c() {}\n")
+        // Only decl: nothing left.
+        #expect(cut("func a() {}\n", "func a") == "")
+    }
+
+    /// The echoed payload must be re-pasteable: content-first, no leading indent.
+    @Test func cutPayloadStartsAtContentNotIndentation() throws {
+        let src = "struct Box {\n    /// doc\n    func f() {}\n}\n"
+        let data = Data(src.utf8)
+        let declStart = src.distance(from: src.startIndex, to: src.range(of: "func f")!.lowerBound)
+        let payload = ClipCmd.cutPayloadRange(in: data, declOffset: declStart, declLength: "func f() {}".utf8.count)
+        #expect(String(decoding: data.subdata(in: payload), as: UTF8.self) == "/// doc\n    func f() {}")
+
+        // The removed range itself is wider — it takes the indent and the newline.
+        let removed = ClipCmd.cutRange(in: data, declOffset: declStart, declLength: "func f() {}".utf8.count)
+        #expect(removed.lowerBound < payload.lowerBound)
+        #expect(removed.upperBound > payload.upperBound)
+    }
+
+    /// clip writes at index-derived byte offsets. An edit made outside clip shifts
+    /// them without invalidating anything, and a shifted-but-in-range offset clears
+    /// the bounds check and splices into the middle of a token — so the resolver has
+    /// to carry the hash recorded at index time for run() to compare against.
+    @Test func resolveTargetCarriesTheIndexedHashSoStaleWritesCanBeRefused() async throws {
+        let tmp = try makeClipProject()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let db = try await indexed(tmp)
+        let file = tmp.appendingPathComponent("Sources/A.swift")
+
+        let before = try #require(
+            try await ClipCmd.resolveTarget(pattern: "Box", fileFilter: nil, db: db).first
+        )
+        let indexedHash = try #require(before.string("file_sha256"))
+        #expect(!indexedHash.isEmpty)
+        #expect(indexedHash == Indexer.sha256(try Data(contentsOf: file)))
+
+        // Edit outside clip: offsets shift, the index still claims the old hash.
+        let edited = try String(contentsOf: file, encoding: .utf8)
+            .replacingOccurrences(of: "struct Box {", with: "struct Box {  // shifted")
+        try edited.write(to: file, atomically: true, encoding: .utf8)
+
+        let after = try #require(
+            try await ClipCmd.resolveTarget(pattern: "Box", fileFilter: nil, db: db).first
+        )
+        #expect(after.string("file_sha256") == indexedHash)
+        #expect(Indexer.sha256(try Data(contentsOf: file)) != indexedHash)
+    }
+
+    /// A decl's bytes stop below its comment block, so replacing it with a payload
+    /// that carries its own doc appends a second copy rather than overwriting.
+    @Test func startsWithCommentDetectsADocCarryingPayload() {
+        #expect(ClipCmd.startsWithComment(Data("/// doc\nfunc f() {}".utf8)))
+        #expect(ClipCmd.startsWithComment(Data("\n  //# ai:why: x\nfunc f() {}".utf8)))
+        #expect(ClipCmd.startsWithComment(Data("// plain\nfunc f() {}".utf8)))
+        #expect(!ClipCmd.startsWithComment(Data("func f() { /* not leading */ }".utf8)))
+        #expect(!ClipCmd.startsWithComment(Data("@MainActor\nfunc f() {}".utf8)))
+        #expect(!ClipCmd.startsWithComment(Data()))
+        // A lone slash is not a comment and must not read past the end.
+        #expect(!ClipCmd.startsWithComment(Data("/".utf8)))
+    }
+
+    private func indexed(_ tmp: URL) async throws -> Database {
+        let project = try Project.load(explicitRoot: tmp.path)
+        try FileManager.default.createDirectory(at: project.dbDir, withIntermediateDirectories: true)
+        let db = try Database(path: project.dbPath, mode: .readWrite)
+        try await Schema.bootstrap(db)
+        _ = try await Indexer(project: project, db: db).run(full: false)
+        return db
+    }
+
+    private func makeClipProject() throws -> URL {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("cm-clip-\(UUID().uuidString)")
+        let sources = tmp.appendingPathComponent("Sources")
+        try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
+        try """
+        extension String {
+            func shared() -> Int { 1 }
+        }
+        struct Box {
+            var v: Int
+            func note() -> Int { 1 }
+        }
+        func standalone() -> Int { 1 }
+        """.write(to: sources.appendingPathComponent("A.swift"), atomically: true, encoding: .utf8)
+        try """
+        extension String {
+            func shared() -> Int { 2 }
+        }
+        """.write(to: sources.appendingPathComponent("B.swift"), atomically: true, encoding: .utf8)
+        try Config.defaultTOML.write(
+            to: tmp.appendingPathComponent(".code-monkey.toml"), atomically: true, encoding: .utf8
+        )
+        return tmp
+    }
+}
+
+@Suite struct EditTests {
+
+    /// A move usually changes nesting depth, so the block has to be re-indented as a
+    /// whole — while keeping the nesting *inside* it.
+    @Test func reindentShiftsABlockWithoutFlatteningIt() {
+        let block = Data("""
+        /// Doc.
+            func f() -> Int {
+                if x {
+                    return 1
+                }
+            }
+        """.utf8)
+        // Member (4) -> top level (0).
+        #expect(String(decoding: EditOps.reindent(block, from: "    ", to: ""), as: UTF8.self) == """
+        /// Doc.
+        func f() -> Int {
+            if x {
+                return 1
+            }
+        }
+        """)
+        // Top level (0) -> member (4): nesting inside must survive.
+        let flat = Data("func f() -> Int {\n    return 1\n}".utf8)
+        #expect(String(decoding: EditOps.reindent(flat, from: "", to: "    "), as: UTF8.self)
+                == "    func f() -> Int {\n        return 1\n    }")
+    }
+
+    @Test func reindentLeavesBlankLinesBlank() {
+        let d = Data("a\n\n    b".utf8)
+        #expect(String(decoding: EditOps.reindent(d, from: "", to: "  "), as: UTF8.self) == "  a\n\n      b")
+    }
+
+    /// Edits are applied last-first so earlier offsets stay valid.
+    @Test func applyRunsLaterEditsFirst() {
+        let d = Data("0123456789".utf8)
+        let out = EditOps.apply([(2..<4, Data("XX".utf8)), (6..<8, Data("Y".utf8))], to: d)
+        #expect(String(decoding: out, as: UTF8.self) == "01XX45Y89")
+    }
+
+    @Test func nameOffsetFindsTheDeclaredNameAsAWholeWord() {
+        // `note` appears inside `noteworthy` first; the whole-word match must skip it.
+        let src = "func noteworthy() {}\nfunc note(note: Int) {}"
+        let data = Data(src.utf8)
+        let declStart = src.distance(from: src.startIndex, to: src.range(of: "func note(")!.lowerBound)
+        let at = EditOps.nameOffset(in: data, declRange: declStart..<data.count, name: "note")
+        #expect(at == declStart + 5)
+        #expect(EditOps.nameOffset(in: data, declRange: 0..<data.count, name: "missing") == nil)
+    }
+
+    @Test func renameOnlyAcceptsBareIdentifiers() {
+        #expect(EditOps.isIdentifier("observe"))
+        #expect(EditOps.isIdentifier("_private2"))
+        #expect(!EditOps.isIdentifier(""))
+        #expect(!EditOps.isIdentifier("2fast"))
+        #expect(!EditOps.isIdentifier("has space"))
+        #expect(!EditOps.isIdentifier("has(paren)"))
+    }
+}
+
+@Suite("Bridge write surface")
+struct BridgeWriteSurfaceTests {
+    private func tool(_ name: String) throws -> Tool {
+        let bridge = ToolBridge(root: try CommandModel(CodeMonkey.self).root, policy: ToolPolicy())
+        guard let match = bridge.tools().first(where: { $0.name == name }) else {
+            Issue.record("no tool named \(name)")
+            throw CancellationError()
+        }
+        return match
+    }
+
+    private func properties(_ name: String) throws -> [String: Value] {
+        try tool(name).inputSchema.objectValue?["properties"]?.objectValue ?? [:]
+    }
+
+    /// Regression. `clip` once had a single mode, so the policy hid `paste_replacing` and
+    /// appended `--paste-replacing` to every call. With four mutually exclusive modes that
+    /// injection makes each of the other three unreachable — and worse, a client that selects
+    /// one gets two modes on the command line and an error every time.
+    //# ai:invariant: no clip mode may be injected; the client chooses exactly one
+    @Test func everyClipModeIsReachableFromAClient() throws {
+        let keys = try properties("code_monkey_clip")
+        for mode in ["paste_replacing", "paste_after", "paste_before", "cut", "with_doc"] {
+            #expect(keys[mode] != nil, "clip mode `\(mode)` is not exposed to clients")
+        }
+        #expect(ToolPolicy().injectedArguments["code_monkey_clip"] == nil,
+                "a mode flag is being injected, which overrides the client's choice")
+    }
+
+    /// `cut` removes a declaration and reads nothing, so a required payload would force the
+    /// client to invent one.
+    @Test func theClipPayloadIsOptionalBecauseCutHasNone() throws {
+        let required = try tool("code_monkey_clip").inputSchema.objectValue?["required"]?.arrayValue ?? []
+        #expect(!required.contains(.string("new_body")))
+        #expect(try properties("code_monkey_clip")["new_body"] != nil)
+    }
+
+    /// The structural surface has to arrive over MCP too, or the CLI and the server disagree
+    /// about what the tool can do — which is how this port was found to be incomplete.
+    @Test func moveAndRenameAreExposedWithTheirArguments() throws {
+        #expect(try properties("code_monkey_move")["to"] != nil)
+        #expect(try properties("code_monkey_move")["after"] != nil)
+        #expect(try properties("code_monkey_rename")["to"] != nil)
+    }
+
+    /// A profile that offers `clip` but not `move` or `rename` describes a surface the CLI
+    /// does not have. The write surface arrives whole or the profile is lying about itself.
+    //# ai:invariant: every source-writing command is in the write profile
+    @Test func theWriteProfileCarriesTheWholeWriteSurface() {
+        for tool in ["code_monkey_clip", "code_monkey_move", "code_monkey_rename"] {
+            #expect(ToolPolicy.Profile.write.contains(tool), "`\(tool)` is missing from the write profile")
+        }
+        #expect(ToolPolicy.Profile.read.isSubset(of: ToolPolicy.Profile.write))
+        for readOnly in ["code_monkey_move", "code_monkey_rename", "code_monkey_clip"] {
+            #expect(!ToolPolicy.Profile.read.contains(readOnly), "`\(readOnly)` writes; it cannot be in read")
+        }
+    }
+
+    /// Every CLI subcommand is a tool, and nothing is a tool that is not a subcommand.
+    //# ai:invariant: the bridge is the only thing that decides this — never a hand-written list
+    @Test func theToolListIsExactlyTheCommandTree() throws {
+        let bridge = ToolBridge(root: try CommandModel(CodeMonkey.self).root, policy: ToolPolicy())
+        let tools = Set(bridge.tools().map(\.name))
+        for command in ["clip", "move", "rename", "get", "code", "calls", "index", "weave"] {
+            #expect(tools.contains("code_monkey_\(command)"), "`\(command)` is missing from the tool list")
+        }
+        for excluded in ["repl", "help"] {
+            #expect(!tools.contains("code_monkey_\(excluded)"), "`\(excluded)` cannot be driven by a client")
+        }
+    }
+}
+
+@Suite("Doctor")
+struct DoctorTests {
+    /// A temp directory that cleans itself up when the test ends.
+    private func withTempDir(_ body: (URL) throws -> Void) rethrows {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("cm-doctor-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try body(dir)
+    }
+
+    @Test func readsTheCheckoutBuildFromSource() throws {
+        try withTempDir { root in
+            let sources = root.appendingPathComponent("Sources/code-monkey")
+            try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
+            try """
+            // Generated by Makefile. Do not edit.
+            enum BuildInfo {
+                static let version = "1.0.0"
+                static let buildDate = "2026-09-04T00:00:00Z"
+                static let buildSeq = 42
+                static let commit = "deadbee"
+            }
+            """.write(to: sources.appendingPathComponent("BuildInfo.swift"), atomically: true, encoding: .utf8)
+
+            let build = DoctorCmd.checkoutBuild(project: Project(root: root, config: Config()))
+            #expect(build.seq == 42)
+            #expect(build.commit == "deadbee")
+            #expect(build.date == "2026-09-04T00:00:00Z")
+        }
+    }
+
+    @Test func missingBuildInfoIsUnknownRatherThanACrash() throws {
+        try withTempDir { root in
+            let build = DoctorCmd.checkoutBuild(project: Project(root: root, config: Config()))
+            #expect(build.seq == nil)
+            #expect(build.commit == nil)
+        }
+    }
+
+    /// The manifest is the only thing that can name the checkout an installed binary came from,
+    /// which is the whole point of writing it.
+    @Test func readsAnInstallManifestBesideABinary() throws {
+        try withTempDir { dir in
+            try #"""
+            {"source_root":"/somewhere/else","commit":"abc1234","build_seq":7,"build_date":"2026-09-02T00:00:00Z","version":"1.0.0"}
+            """#.write(to: dir.appendingPathComponent(".code-monkey-build.json"), atomically: true, encoding: .utf8)
+
+            let manifest = DoctorCmd.manifest(besideBinaryAt: dir.appendingPathComponent("code-monkey"))
+            #expect(manifest?.source_root == "/somewhere/else")
+            #expect(manifest?.commit == "abc1234")
+            #expect(manifest?.build_seq == 7)
+        }
+    }
+
+    @Test func anUnstampedBinaryHasNoManifest() throws {
+        try withTempDir { dir in
+            #expect(DoctorCmd.manifest(besideBinaryAt: dir.appendingPathComponent("code-monkey")) == nil)
+        }
+    }
+
+    /// Regression. `make install` copies, so the installed file's mtime is always newer than the
+    /// checkout it came from — a date comparison can never see a stale install. Staleness is a
+    /// property of the build sequence, and the sequence is monotonic by construction.
+    //# ai:invariant: never reintroduce an mtime comparison here
+    @Test func staleInstallIsDetectedByBuildSeqEvenWhenItsMtimeIsNewer() throws {
+        try withTempDir { root in
+            let sources = root.appendingPathComponent("Sources/code-monkey")
+            try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
+            let buildInfo = sources.appendingPathComponent("BuildInfo.swift")
+            try """
+            enum BuildInfo {
+                static let buildDate = "2026-08-30T00:00:00Z"
+                static let buildSeq = 21
+                static let commit = "6d7a926"
+            }
+            """.write(to: buildInfo, atomically: true, encoding: .utf8)
+
+            // The installed binary is the newest file on disk and still the older build.
+            let installed = root.appendingPathComponent("bin")
+            try FileManager.default.createDirectory(at: installed, withIntermediateDirectories: true)
+            let binary = installed.appendingPathComponent("code-monkey")
+            try Data().write(to: binary)
+            try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: binary.path)
+
+            let checkoutMtime = (try FileManager.default.attributesOfItem(atPath: buildInfo.path)[.modificationDate]) as! Date
+            let binaryMtime = (try FileManager.default.attributesOfItem(atPath: binary.path)[.modificationDate]) as! Date
+            #expect(binaryMtime >= checkoutMtime, "the copy must look newer, or this test proves nothing")
+
+            let checkout = DoctorCmd.checkoutBuild(project: Project(root: root, config: Config()))
+            let runningSeq = 20
+            #expect(checkout.seq == 21)
+            #expect(checkout.seq! > runningSeq, "buildSeq sees the staleness that mtime cannot")
+        }
     }
 }

@@ -65,7 +65,9 @@ code-monkey get       # everything, cheapest possible read
 | `imports` | import lines with `@_spi` groups and `@testable` marks |
 | `query` | read-only SQL against the index |
 | `weave` | Markdown literate projection |
-| `clip` | the single write primitive — replace one declaration |
+| `clip` | write one declaration: replace, insert before/after, or cut |
+| `move` | relocate a declaration, with its comment block, to another file |
+| `rename` | rename a declaration; call sites are reported, never rewritten |
 | `file` | audited read/write outside the indexed tree |
 | `repl` | interactive shell |
 

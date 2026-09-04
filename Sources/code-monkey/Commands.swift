@@ -87,6 +87,22 @@ struct IndexCmd: AsyncParsableCommand {
 }
 
 struct DoctorReport: Codable, Sendable {
+    /// What a `code-monkey` binary says about its own origin.
+    ///
+    /// Assembled from two sources that answer different halves of the question: `BuildInfo`,
+    /// compiled in, says *what* was built; the install manifest beside the binary says *where
+    /// from*. Only the running executable can report the former about itself, so an installed
+    /// peer with no manifest is genuinely unidentifiable — say so rather than guessing.
+    struct BuildIdentity: Codable, Sendable {
+        let path: String
+        /// `running` | `installed-peer` | `checkout`
+        let role: String
+        let source_root: String?
+        let commit: String?
+        let build_seq: Int?
+        let build_date: String?
+    }
+
     let executable: String
     let checkout_executable: String?
     let using_checkout_executable: Bool?
@@ -99,41 +115,165 @@ struct DoctorReport: Codable, Sendable {
     let call_sites: String?
     let audit_path: String
     let freshness: IndexCheckResult?
+    let running_build: BuildIdentity
+    let checkout_build: BuildIdentity?
+    let mcp_build: BuildIdentity?
     let warnings: [String]
 }
+
 
 struct DoctorCmd: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "doctor",
-        abstract: "Diagnose executable, index, concurrency, audit, and freshness state."
+        abstract: "Diagnose executable provenance, index, concurrency, audit, and freshness state."
     )
     @OptionGroup var opts: GlobalOptions
+
+    /// Written by `make install` beside the binaries it installs.
+    ///
+    /// The binary itself cannot say which checkout produced it: `BuildInfo` is committed, so the
+    /// commit it names is a property of the source, not of the working copy that ran the compiler.
+    /// Several repositories on one machine can build binaries of the same name from unrelated
+    /// histories, and the only symptom is a schema mismatch or an MCP tool list that disagrees
+    /// with the CLI. This file closes that gap.
+    //# ai:see: Makefile install target
+    struct InstallManifest: Codable, Sendable {
+        let source_root: String
+        let commit: String
+        let build_seq: Int
+        let build_date: String
+        let version: String
+    }
+
+    /// The manifest sitting beside `url`, if `make install` put one there.
+    static func manifest(besideBinaryAt url: URL) -> InstallManifest? {
+        let path = url.deletingLastPathComponent().appendingPathComponent(".code-monkey-build.json")
+        guard let data = try? Data(contentsOf: path) else { return nil }
+        return try? JSONDecoder().decode(InstallManifest.self, from: data)
+    }
+
+    /// `BuildInfo.swift` as the checkout currently has it — what the *next* build here would carry.
+    ///
+    /// Read from source rather than by executing `.build/debug/code-monkey`: a diagnostic must not
+    /// depend on the binary it is diagnosing being runnable.
+    static func checkoutBuild(project: Project) -> (seq: Int?, commit: String?, date: String?) {
+        let path = project.root.appendingPathComponent("Sources/code-monkey/BuildInfo.swift")
+        guard let text = try? String(contentsOf: path, encoding: .utf8) else { return (nil, nil, nil) }
+        func capture(_ pattern: String) -> String? {
+            guard let range = text.range(of: pattern, options: .regularExpression) else { return nil }
+            let match = String(text[range])
+            guard let open = match.range(of: "= ") else { return nil }
+            return String(match[open.upperBound...]).trimmingCharacters(in: CharacterSet(charactersIn: "\" "))
+        }
+        return (
+            capture("buildSeq = [0-9]+").flatMap(Int.init),
+            capture("commit = \"[^\"]*\""),
+            capture("buildDate = \"[^\"]*\"")
+        )
+    }
 
     mutating func run() async throws {
         let project = try opts.resolveProject()
         let executable = Bundle.main.executableURL?.standardizedFileURL.path
             ?? CommandLine.arguments[0]
+        let executableURL = URL(fileURLWithPath: executable)
         let checkoutURL = project.root.appendingPathComponent(".build/debug/code-monkey")
         let checkoutExists = FileManager.default.fileExists(atPath: checkoutURL.path)
         let checkoutExecutable = checkoutExists ? checkoutURL.standardizedFileURL.path : nil
         let usingCheckout = checkoutExecutable.map { $0 == executable }
-        let executableDate = (try? FileManager.default.attributesOfItem(atPath: executable)[.modificationDate]) as? Date
-        let checkoutDate = checkoutExecutable.flatMap {
-            (try? FileManager.default.attributesOfItem(atPath: $0)[.modificationDate]) as? Date
+        var warnings: [String] = []
+
+        // Provenance. A binary under the project tree was necessarily built from it; anything
+        // else has to produce a manifest, and an installed binary that cannot is a finding in
+        // its own right — it predates `make install` learning to stamp one.
+        let insideProject = executable.hasPrefix(project.root.standardizedFileURL.path + "/")
+        let installed = Self.manifest(besideBinaryAt: executableURL)
+        let runningSourceRoot = insideProject ? project.root.path : installed?.source_root
+        let runningBuild = DoctorReport.BuildIdentity(
+            path: executable,
+            role: "running",
+            source_root: runningSourceRoot,
+            commit: BuildInfo.commit,
+            build_seq: BuildInfo.buildSeq,
+            build_date: BuildInfo.buildDate
+        )
+
+        let checkout = Self.checkoutBuild(project: project)
+        let checkoutBuild = DoctorReport.BuildIdentity(
+            path: project.root.appendingPathComponent("Sources/code-monkey/BuildInfo.swift").path,
+            role: "checkout",
+            source_root: project.root.path,
+            commit: checkout.commit,
+            build_seq: checkout.seq,
+            build_date: checkout.date
+        )
+
+        // The MCP server is what agents actually talk to, and it is installed as a peer of the
+        // CLI. Report it by path and manifest only: it speaks stdio JSON-RPC, so executing it to
+        // ask its version would hang.
+        let mcpURL = executableURL.deletingLastPathComponent().appendingPathComponent("code-monkey-mcp")
+        var mcpBuild: DoctorReport.BuildIdentity?
+        if FileManager.default.fileExists(atPath: mcpURL.path) {
+            let peer = Self.manifest(besideBinaryAt: mcpURL)
+            // A peer under the project tree was built from it, manifest or not — the manifest
+            // only exists to identify binaries that have been copied away from their source.
+            let peerInsideProject = mcpURL.path.hasPrefix(project.root.standardizedFileURL.path + "/")
+            mcpBuild = DoctorReport.BuildIdentity(
+                path: mcpURL.path,
+                role: peerInsideProject ? "checkout" : "installed-peer",
+                source_root: peerInsideProject ? project.root.path : peer?.source_root,
+                commit: peer?.commit,
+                build_seq: peer?.build_seq,
+                build_date: peer?.build_date
+            )
         }
+
+        if let runningSourceRoot, runningSourceRoot != project.root.path {
+            warnings.append(
+                "running executable was built from \(runningSourceRoot), not this project "
+                    + "(\(project.root.path)); reinstall from here or run the checkout build"
+            )
+        }
+        if !insideProject && installed == nil {
+            warnings.append(
+                "installed executable has no build manifest, so its origin is unknown; "
+                    + "run make install to stamp one"
+            )
+        }
+        // Sequence, not mtime: `make install` copies, which gives the installed file a fresh
+        // mtime every time, so a date comparison can never see a stale install.
+        //# ai:invariant: staleness is decided by buildSeq, never by file modification date
+        if runningSourceRoot == project.root.path,
+           let checkoutSeq = checkout.seq,
+           checkoutSeq > BuildInfo.buildSeq {
+            warnings.append(
+                "checkout is at build #\(checkoutSeq); running executable is #\(BuildInfo.buildSeq) "
+                    + "— rebuild and reinstall"
+            )
+        }
+        if let checkoutCommit = checkout.commit, checkoutCommit != BuildInfo.commit {
+            warnings.append(
+                "running executable was built at commit \(BuildInfo.commit); "
+                    + "this checkout is at \(checkoutCommit)"
+            )
+        }
+        if let mcpBuild, let cliRoot = runningSourceRoot, mcpBuild.source_root != cliRoot {
+            warnings.append(
+                "MCP server at \(mcpBuild.path) was built from "
+                    + "\(mcpBuild.source_root ?? "an unknown source") but the CLI from \(cliRoot); "
+                    + "its tool list may not match this CLI"
+            )
+        }
+        if !insideProject && mcpBuild == nil {
+            warnings.append("no code-monkey-mcp beside the installed CLI; MCP clients have nothing to run")
+        }
+
         let indexExists = FileManager.default.fileExists(atPath: project.dbPath.path)
         var schemaVersion: Int?
         var journalMode: String?
         var callSites: String?
         var freshness: IndexCheckResult?
-        var warnings: [String] = []
 
-        if let checkoutExecutable,
-           checkoutExecutable != executable,
-           let checkoutDate,
-           checkoutDate > (executableDate ?? .distantPast) {
-            warnings.append("checkout build differs from running executable; use \(checkoutExecutable)")
-        }
         if indexExists {
             let db = try Database(path: project.dbPath, mode: .readOnly)
             schemaVersion = try await db.query(
@@ -165,6 +305,9 @@ struct DoctorCmd: AsyncParsableCommand {
             call_sites: callSites,
             audit_path: AuditLog.url(project: project).path,
             freshness: freshness,
+            running_build: runningBuild,
+            checkout_build: checkoutBuild,
+            mcp_build: mcpBuild,
             warnings: warnings
         )
         Printer.emit(
@@ -174,13 +317,26 @@ struct DoctorCmd: AsyncParsableCommand {
             warnings: warnings,
             freshness: freshness?.needsRefresh == true ? "stale" : (indexExists ? "fresh" : "missing")
         ) {
-            [
+            var lines = [
                 "executable=\(report.executable)",
-                "project=\(report.project_root)",
-                "index=\(report.index_exists ? "present" : "missing") schema=\(report.schema_version.map(String.init) ?? "-")/\(report.expected_schema_version) journal=\(report.journal_mode ?? "-") call_sites=\(report.call_sites ?? "-")",
-                "audit=\(report.audit_path)",
-                warnings.isEmpty ? "status=ok" : "warnings=\(warnings.joined(separator: " | "))",
-            ].joined(separator: "\n")
+                "built_from=\(runningSourceRoot ?? "unknown") commit=\(BuildInfo.commit) build=#\(BuildInfo.buildSeq)",
+                "checkout=\(project.root.path) commit=\(checkout.commit ?? "-") build=#\(checkout.seq.map(String.init) ?? "-")",
+            ]
+            if let mcpBuild {
+                lines.append(
+                    "mcp=\(mcpBuild.path) built_from=\(mcpBuild.source_root ?? "unknown") "
+                        + "build=#\(mcpBuild.build_seq.map(String.init) ?? "-")"
+                )
+            }
+            lines.append("project=\(report.project_root)")
+            lines.append(
+                "index=\(report.index_exists ? "present" : "missing") "
+                    + "schema=\(report.schema_version.map(String.init) ?? "-")/\(report.expected_schema_version) "
+                    + "journal=\(report.journal_mode ?? "-") call_sites=\(report.call_sites ?? "-")"
+            )
+            lines.append("audit=\(report.audit_path)")
+            lines.append(warnings.isEmpty ? "status=ok" : "warnings=\(warnings.joined(separator: " | "))")
+            return lines.joined(separator: "\n")
         }
     }
 }
@@ -530,24 +686,55 @@ struct ImportsCmd: AsyncParsableCommand {
 struct ClipCmd: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "clip",
         abstract: """
-        Replace a declaration's full text by decl_id/name. Write-only — reading is what \
-        `get` is for.
+        Write a declaration by decl_id/name: replace it, insert before or after it, or cut \
+        it out. Write-only — reading is what `get` is for.
         """,
         discussion: """
-        The replacement is the declaration's entire text, attributes and signature included, \
-        and it overwrites the matched declaration outright. An ambiguous name is refused \
-        rather than guessed; narrow it with `--file`, or name the decl_id exactly. The file is \
-        re-indexed on the way out, so the index never lags the write.
+        Exactly one mode is required. `--paste-replacing` overwrites the matched declaration \
+        with stdin, which must carry the whole declaration, attributes and signature included. \
+        `--paste-after` and `--paste-before` insert stdin as a new declaration beside the \
+        matched one in the same scope, re-indenting it and supplying their own blank-line \
+        separator — use them to add a member rather than rewriting its container. `--cut` \
+        deletes the declaration together with its comment block and echoes the removed source \
+        to stdout, so it can be pasted back verbatim.
+
+        A declaration's stored bytes begin at the declaration itself, so the commentary above \
+        it is untouched by a replacement. A payload that repeats the doc comment would land \
+        under the existing one; that is refused, and `--with-doc` is how a comment block is \
+        edited deliberately.
+
+        Writes land at index-derived byte offsets, so the file's SHA-256 is checked against \
+        the one recorded at index time and a mismatch is refused outright — an edit made \
+        elsewhere shifts every later offset and would otherwise splice into the middle of a \
+        token. Run `index` after any edit this command did not make. An ambiguous name is \
+        refused rather than guessed; narrow it with `--file`, or name the decl_id exactly. \
+        Status goes to stderr, so stdout carries only what `--cut` removed.
         """)
     @OptionGroup var opts: GlobalOptions
     @Argument var pattern: String
     @Option(name: .long, help: "Restrict to this file (disambiguates same-named decls).")
     var file: String?
-    @Flag(name: .long, help: "Required. Replace the matched decl with stdin.") var pasteReplacing: Bool = false
+    @Flag(name: .long, help: "Replace the matched decl with stdin.") var pasteReplacing: Bool = false
+
+    @Flag(name: .long, help: "Insert stdin as a new decl directly after the matched one.") var pasteAfter: Bool = false
+
+    @Flag(name: .long, help: "Insert stdin as a new decl directly before the matched one, above its doc comment.") var pasteBefore: Bool = false
+
+    @Flag(name: .long, help: "Delete the matched decl and its doc comment, echoing the removed source to stdout.") var cut: Bool = false
+
+    @Flag(name: .long, help: "With --paste-replacing: replace the decl's comment block too, so stdin carries it.") var withDoc: Bool = false
 
     mutating func run() async throws {
-        guard pasteReplacing else {
-            FileHandle.standardError.write(Data("clip is write-only — pass --paste-replacing, or use `get --fields body` to read\n".utf8))
+        guard !withDoc || pasteReplacing else {
+            FileHandle.standardError.write(Data("--with-doc only applies to --paste-replacing\n".utf8))
+            throw ExitCode(1)
+        }
+        let modes = [pasteReplacing, pasteAfter, pasteBefore, cut].filter { $0 }.count
+        guard modes == 1 else {
+            let msg = modes == 0
+                ? "clip is write-only — pass one of --paste-replacing, --paste-after, --paste-before, --cut; to read a decl use `get --fields body`\n"
+                : "pass exactly one of --paste-replacing, --paste-after, --paste-before, --cut\n"
+            FileHandle.standardError.write(Data(msg.utf8))
             throw ExitCode(1)
         }
         let (project, db, _) = try await opts.openIndex(
@@ -556,18 +743,11 @@ struct ClipCmd: AsyncParsableCommand {
             target: pattern,
             writable: true
         )
-        var sql = """
-            SELECT d.id, d.decl_id, d.signature, d.decl_offset, d.decl_length, f.path AS file_path
-              FROM declarations d JOIN files f ON f.id=d.file_id
-             WHERE (d.decl_id = ? OR d.name = ? OR d.decl_id LIKE ? OR d.signature LIKE ?)
-            """
-        var binds: [Bindable] = [pattern, pattern, "%" + pattern + "%", "%" + pattern + "%"]
-        if let file {
-            sql += " AND f.path = ?"
-            binds.append(relativePath(file, root: project.root))
-        }
-        sql += " ORDER BY f.path, d.start_line"
-        let rows = try await db.query(sql, binds)
+        let rows = try await ClipCmd.resolveTarget(
+            pattern: pattern,
+            fileFilter: file.map { relativePath($0, root: project.root) },
+            db: db
+        )
         if rows.isEmpty {
             FileHandle.standardError.write(Data("no match for `\(pattern)` — try `code-monkey index`\n".utf8))
             throw ExitCode(1)
@@ -581,19 +761,296 @@ struct ClipCmd: AsyncParsableCommand {
         }
         let row = rows[0]
         let rel = row.string("file_path") ?? ""
+        let declId = row.string("decl_id") ?? ""
         let offset = Int(row.int64("decl_offset") ?? 0)
         let length = Int(row.int64("decl_length") ?? 0)
         let url = project.root.appendingPathComponent(rel)
-        let newBody = FileHandle.standardInput.readDataToEndOfFile()
         guard var data = try? Data(contentsOf: url) else {
             FileHandle.standardError.write(Data("cannot read \(rel)\n".utf8))
             throw ExitCode(1)
         }
-        data.replaceSubrange(offset..<offset+length, with: newBody)
+        // Every mode writes at byte offsets taken from the index. An edit made outside
+        // `clip` shifts them without invalidating anything, and a shifted-but-in-range
+        // offset clears the bounds check below and splices into the middle of a token.
+        // Compare the file against the hash recorded at index time and refuse instead.
+        //# ai:invariant: clip never writes to a file whose bytes differ from the index
+        if let indexed = row.string("file_sha256"), !indexed.isEmpty,
+           Indexer.sha256(data) != indexed {
+            let msg = "\(rel) changed since it was indexed — refusing to write at stale "
+                    + "offsets. Run `code-monkey index` and retry.\n"
+            FileHandle.standardError.write(Data(msg.utf8))
+            throw ExitCode(1)
+        }
+        guard offset >= 0, length >= 0, offset + length <= data.count else {
+            FileHandle.standardError.write(Data("stale offsets for \(declId) — run `code-monkey index`\n".utf8))
+            throw ExitCode(1)
+        }
+        let verb: String
+        if cut {
+            // Echo what was removed so a delete is recoverable from the shell — and
+            // echo it the way the paste modes expect to receive it: starting at the
+            // block's first content byte, since they supply the leading indent
+            // themselves. Emitting the cut range verbatim would double-indent the
+            // first line on the way back in.
+            let payload = ClipCmd.cutPayloadRange(in: data, declOffset: offset, declLength: length)
+            var echoed = data.subdata(in: payload)
+            echoed.append(0x0A)
+            FileHandle.standardOutput.write(echoed)
+            data.replaceSubrange(ClipCmd.cutRange(in: data, declOffset: offset, declLength: length), with: Data())
+            verb = "cut"
+        } else {
+            let stdin = FileHandle.standardInput.readDataToEndOfFile()
+            // An empty payload is never a real edit — it is a failed `cat`, a closed
+            // pipe, or a typo'd heredoc. Writing it silently deletes the decl (and
+            // still compiles, when a protocol supplies a default), so refuse.
+            //# ai:invariant: a paste mode never writes an empty payload
+            guard !ClipCmd.trimmingTrailingNewlines(stdin).isEmpty else {
+                FileHandle.standardError.write(Data(
+                    "empty stdin — refusing to write nothing over \(declId). Pass --cut to delete.\n".utf8))
+                throw ExitCode(1)
+            }
+            switch true {
+            case pasteReplacing:
+                if withDoc {
+                    data.replaceSubrange(
+                        ClipCmd.cutPayloadRange(in: data, declOffset: offset, declLength: length),
+                        with: stdin
+                    )
+                    verb = "replaced (with doc)"
+                } else {
+                    // The decl's bytes stop below its comment block, so a payload that
+                    // carries its own doc lands *under* the existing one.
+                    let hasBlock = ClipCmd.leadingBlockStart(of: data, at: offset) != offset
+                    guard !hasBlock || !ClipCmd.startsWithComment(stdin) else {
+                        FileHandle.standardError.write(Data("""
+                            \(declId) already has a comment block and stdin starts with one — \
+                            replacing would leave both. Drop the comment from stdin, or pass \
+                            --with-doc to replace the block too.
+
+                            """.utf8))
+                        throw ExitCode(1)
+                    }
+                    data.replaceSubrange(offset..<offset + length, with: stdin)
+                    verb = "replaced"
+                }
+            case pasteAfter:
+                let end = offset + length
+                var insert = Data("\n\n".utf8)
+                insert.append(Data(ClipCmd.lineIndent(of: data, at: offset).utf8))
+                insert.append(ClipCmd.trimmingTrailingNewlines(stdin))
+                data.replaceSubrange(end..<end, with: insert)
+                verb = "inserted after"
+            default:
+                // Above the decl's doc block, not between the doc and the decl.
+                let at = ClipCmd.leadingBlockStart(of: data, at: offset)
+                var insert = ClipCmd.trimmingTrailingNewlines(stdin)
+                insert.append(Data("\n\n".utf8))
+                insert.append(Data(ClipCmd.lineIndent(of: data, at: at).utf8))
+                data.replaceSubrange(at..<at, with: insert)
+                verb = "inserted before"
+            }
+        }
         try data.write(to: url)
         // Re-index this single file.
         _ = try await Indexer(project: project, db: db).run(full: false)
-        print("replaced \(row.string("decl_id") ?? "") in \(rel)")
+        FileHandle.standardError.write(Data("\(verb) \(declId) in \(rel)\n".utf8))
+    }
+
+    
+
+    /// Whitespace between the start of `offset`'s line and `offset` itself.
+    //# ai:why: a decl's stored bytes begin at the declaration, not at the start of
+    //#         its line, so the indentation that positions it is not part of what
+    //#         `clip` replaces. An inserted sibling has to be given that indent back
+    //#         or it lands at column zero inside its container.
+    static func lineIndent(of data: Data, at offset: Int) -> String {
+        var start = offset
+        while start > 0, data[data.startIndex + start - 1] != 0x0A { start -= 1 }
+        var indent = ""
+        var i = start
+        while i < offset {
+            switch data[data.startIndex + i] {
+            case 0x20: indent += " "
+            case 0x09: indent += "\t"
+            default: return indent
+            }
+            i += 1
+        }
+        return indent
+    }
+
+    /// Drop trailing newlines so `--paste-after` controls its own separation.
+    //# ai:why: `--paste-replacing` writes stdin verbatim, so a trailing newline from
+    //#         `echo` leaves a blank line behind the decl. Insertion supplies its own
+    //#         separator, so the same input must not stack a second one.
+    static func trimmingTrailingNewlines(_ d: Data) -> Data {
+        var end = d.endIndex
+        while end > d.startIndex {
+            let b = d[d.index(before: end)]
+            guard b == 0x0A || b == 0x0D else { break }
+            end = d.index(before: end)
+        }
+        return d.subdata(in: d.startIndex..<end)
+    }
+
+    /// Byte index of the start of the line containing `offset`.
+    static func lineStart(of data: Data, at offset: Int) -> Int {
+        var i = min(offset, data.count)
+        while i > 0, data[data.startIndex + i - 1] != 0x0A { i -= 1 }
+        return i
+    }
+
+    /// True when `[from, to)` holds only whitespace followed by `//`.
+    static func isCommentLine(_ data: Data, from: Int, to: Int) -> Bool {
+        var i = from
+        while i < to, data[data.startIndex + i] == 0x20 || data[data.startIndex + i] == 0x09 { i += 1 }
+        guard i + 1 < to else { return false }
+        return data[data.startIndex + i] == 0x2F && data[data.startIndex + i + 1] == 0x2F
+    }
+
+    /// True when the payload's first non-blank line is a comment.
+    //# ai:why: decl bytes exclude the comment block above them, so replacing a decl
+    //#         with a payload that carries its own doc comment appends a second copy
+    //#         above the first instead of overwriting it. Silent, and it shipped once.
+    static func startsWithComment(_ d: Data) -> Bool {
+        var i = d.startIndex
+        while i < d.endIndex, [0x20, 0x09, 0x0A, 0x0D].contains(d[i]) { i = d.index(after: i) }
+        guard i < d.endIndex, d[i] == 0x2F else { return false }
+        let next = d.index(after: i)
+        return next < d.endIndex && d[next] == 0x2F
+    }
+
+    /// First content byte of the comment block introducing the decl at `offset` —
+    /// its `///` docs, `//# ai:` directives and any plain `//` lines — or the decl's
+    /// own first content byte when no comment precedes it.
+    //# ai:why: decl_offset points at the declaration proper; a comment introducing it
+    //#         is deliberately not part of the decl's bytes (its text lives in
+    //#         doc_comments/directives instead). So the block has to be re-derived
+    //#         from the source to insert above it or delete along with it. Scanning
+    //#         also keeps this correct regardless of what the extractor decides a
+    //#         decl's bytes are.
+    static func leadingBlockStart(of data: Data, at offset: Int) -> Int {
+        var start = lineStart(of: data, at: offset)
+        while start > 0 {
+            let prev = lineStart(of: data, at: start - 1)
+            guard isCommentLine(data, from: prev, to: start - 1) else { break }
+            start = prev
+        }
+        var i = start
+        while i < offset, data[data.startIndex + i] == 0x20 || data[data.startIndex + i] == 0x09 { i += 1 }
+        return i
+    }
+
+    /// The byte range `--cut` removes: the decl, the comment block introducing it,
+    /// the indentation on the first line, and one trailing newline.
+    //# ai:invariant: cutting never leaves two blank lines where there was one, and
+    //#               never leaves a blank line at the start or end of the file, or
+    //#               dangling at the end of the container it emptied
+    static func cutRange(in data: Data, declOffset: Int, declLength: Int) -> Range<Int> {
+        var start = lineStart(of: data, at: leadingBlockStart(of: data, at: declOffset))
+        var end = min(declOffset + declLength, data.count)
+        while end < data.count, data[data.startIndex + end] == 0x20 || data[data.startIndex + end] == 0x09 { end += 1 }
+        if end < data.count, data[data.startIndex + end] == 0x0D { end += 1 }
+        if end < data.count, data[data.startIndex + end] == 0x0A { end += 1 }
+
+        // The decl sat between two separators; removing it would leave both. Start of
+        // file counts as a separator, so cutting the first decl doesn't leave the file
+        // opening on a blank line.
+        let blankBelow = blankLine(data, at: end)
+        let blankAbove = start == 0 || blankLineEnding(data, before: start)
+        if blankBelow, blankAbove {
+            while end < data.count, data[data.startIndex + end] != 0x0A { end += 1 }
+            if end < data.count { end += 1 }
+        } else if end >= data.count, start > 0, blankLineEnding(data, before: start) {
+            // Nothing follows, so the separator to drop is the one above.
+            start = lineStart(of: data, at: start - 1)
+        } else if !blankBelow, start > 0, blankLineEnding(data, before: start),
+                  indentWidth(data, at: end) < indentWidth(data, at: start) {
+            // The next line is dedented: this was the last member of its container, so
+            // the separator above it would be left dangling before the closing brace.
+            start = lineStart(of: data, at: start - 1)
+        }
+        return start..<end
+    }
+
+    /// Count of leading spaces/tabs on the line beginning at `offset`.
+    static func indentWidth(_ data: Data, at offset: Int) -> Int {
+        var i = offset
+        var n = 0
+        while i < data.count, data[data.startIndex + i] == 0x20 || data[data.startIndex + i] == 0x09 {
+            n += 1
+            i += 1
+        }
+        return n
+    }
+
+    /// The bytes `--cut` echoes: the comment block and decl, starting at the first
+    /// content byte rather than at the start of the line.
+    //# ai:invariant: round-trips through --paste-before/--paste-after unchanged
+    //# ai:why: the paste modes re-indent stdin's first line, so a payload carrying
+    //#         its own leading indentation would come back double-indented.
+    static func cutPayloadRange(in data: Data, declOffset: Int, declLength: Int) -> Range<Int> {
+        let start = leadingBlockStart(of: data, at: declOffset)
+        let end = min(declOffset + declLength, data.count)
+        return start..<max(start, end)
+    }
+
+    /// True when the line beginning at `offset` is empty or whitespace-only.
+    static func blankLine(_ data: Data, at offset: Int) -> Bool {
+        var i = offset
+        while i < data.count, data[data.startIndex + i] != 0x0A {
+            let b = data[data.startIndex + i]
+            guard b == 0x20 || b == 0x09 || b == 0x0D else { return false }
+            i += 1
+        }
+        return i < data.count
+    }
+
+    /// True when the line ending immediately before `offset` is blank.
+    static func blankLineEnding(_ data: Data, before offset: Int) -> Bool {
+        guard offset > 0, data[data.startIndex + offset - 1] == 0x0A else { return false }
+        return blankLine(data, at: lineStart(of: data, at: offset - 1))
+    }
+
+    /// Resolve a clip target in two tiers: exact `decl_id` first, fuzzy only if that
+    /// finds nothing.
+    //# ai:invariant: an exact decl_id match never falls through to the fuzzy tier
+    //# ai:why: a container name is a substring of every one of its members' decl_ids,
+    //#         so a single-tier substring match can never resolve a type — `clip Box`
+    //#         reported every member as a rival and refused to write. Mirrors the
+    /// Resolve a clip target in two tiers: exact `decl_id` first, fuzzy only if that
+    /// finds nothing.
+    //# ai:invariant: an exact decl_id match never falls through to the fuzzy tier
+    //# ai:why: a container name is a substring of every one of its members' decl_ids,
+    //#         so a single-tier substring match can never resolve a type — `clip Box`
+    //#         reported every member as a rival and refused to write. Mirrors the
+    //#         tiering in GetCmd.resolve.
+    static func resolveTarget(
+        pattern: String,
+        fileFilter: String?,
+        db: Database
+    ) async throws -> [DatabaseRow] {
+        let cols = """
+            SELECT d.id, d.decl_id, d.signature, d.decl_offset, d.decl_length,
+                   f.path AS file_path, f.sha256 AS file_sha256
+              FROM declarations d JOIN files f ON f.id=d.file_id
+            """
+        func matches(_ clause: String, _ args: [Bindable]) async throws -> [DatabaseRow] {
+            var sql = cols + "\n WHERE " + clause
+            var binds = args
+            if let fileFilter {
+                sql += " AND f.path = ?"
+                binds.append(fileFilter)
+            }
+            sql += " ORDER BY f.path, d.start_line"
+            return try await db.query(sql, binds)
+        }
+        let exact = try await matches("d.decl_id = ?", [pattern])
+        if !exact.isEmpty { return exact }
+        return try await matches(
+            "(d.name = ? OR d.decl_id LIKE ? OR d.signature LIKE ?)",
+            [pattern, "%" + pattern + "%", "%" + pattern + "%"]
+        )
     }
 }
 

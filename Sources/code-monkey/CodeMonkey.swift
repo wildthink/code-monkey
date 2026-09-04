@@ -14,6 +14,8 @@ struct CodeMonkey: AsyncParsableCommand {
             CodeCmd.self,
             CallsCmd.self,
             ClipCmd.self,
+            MoveCmd.self,
+            RenameCmd.self,
             QueryCmd.self,
             WeaveCmd.self,
             ImportsCmd.self,

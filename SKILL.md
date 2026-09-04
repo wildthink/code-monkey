@@ -37,7 +37,8 @@ below describes the behavior once.
    - `repl` and `help` are never exposed. `--json` is injected by the server
      and is not a parameter you can set.
    - The server may advertise a *profile* rather than the whole surface:
-     `read`, `nav`, `write`, or `all`. `write` is a superset of `read`; every
+     `read`, `nav`, `write`, or `all`. `write` is a superset of `read` and
+     carries the whole write surface — `clip`, `move` and `rename`; every
      profile includes `init`/`index`/`doctor`/`version`. If a tool you expect
      is absent, the server was started on a narrower profile — say so rather
      than falling back to `cat`.
@@ -47,14 +48,21 @@ below describes the behavior once.
 Flag ⇄ argument mapping is 1:1: CLI `--limit 5` ⇄ `{"limit": 5}`, CLI
 `--fields signature,body` ⇄ `{"fields": "signature,body"}`. Examples below show
 the CLI form; translate the same way. Two MCP-only arguments have no flag:
-`new_body` (the replacement text for `code_monkey_clip`) and `content` (bytes
+`new_body` (the declaration text for `code_monkey_clip`) and `content` (bytes
 for `code_monkey_file_write`/`_append`) arrive as arguments rather than stdin.
+`new_body` is optional, because `cut` removes a declaration and reads nothing —
+but the paste modes require it, and you must set exactly one mode yourself:
+none is injected.
 
 ---
 
 ## Rules (never break)
 
-- Never read a Swift file with `cat` / `read_file` / `grep`. Use code-monkey always.
+- Never read an **indexed** Swift file with `cat` / `read_file` to learn its
+  structure. Use code-monkey. A Swift file outside `sources` in
+  `.code-monkey.toml` — `Package.swift` above all — is not in the index, so read
+  it directly; `query "SELECT path FROM files"` settles which is which. `rg` is
+  not banned, it is scoped: see *Neighbours* below.
 - Always `index` before the first read in a session.
 - **Always name the project explicitly.** MCP: pass `project` on every call.
   CLI: run inside the project tree, or pass `--project`. An MCP server's default
@@ -70,7 +78,8 @@ for `code_monkey_file_write`/`_append`) arrive as arguments rather than stdin.
 
 Start from known context, not mechanically from the cheapest read:
 
-1. Use `rg --files`, config, manifests, and non-Swift docs for project shape.
+1. Use `fd`, config, manifests, and non-Swift docs for project shape — see
+   *Neighbours* below for the split of labour.
 2. Run one `code-monkey index` before Swift semantic reads.
 3. If symbol is known, call `get <decl_id>` directly. Skip filtered enumeration.
 4. If ownership is unknown, run `get` with `--path`/`--kind`/`--container`/`--name-like`/`--tag` to enumerate.
@@ -78,12 +87,84 @@ Start from known context, not mechanically from the cheapest read:
 6. Use `--fields body` only after a bare `get` shows doc/directives suggest the body matters.
    When the body only makes sense beside its siblings, use `code <Type> --expand <member>` — one call, not two.
 7. Batch independent read-only commands when useful. If one lock occurs, serialize remaining calls.
-8. Stop using `code-monkey` when setup and lookup cost exceeds direct non-Swift inspection value.
+8. Reach for `rg` when the question is about **text inside a body** and `fd` when
+   it is about **files the index doesn't hold**. The index cannot answer either.
+9. Stop using `code-monkey` when setup and lookup cost exceeds direct non-Swift inspection value.
 
 At task end, report calls that produced findings, failed or duplicated calls, and broad source reads avoided.
 
 When developing `code-monkey` itself, use `.build/debug/code-monkey` after
-building. Run `code-monkey doctor` to detect stale `PATH` binaries.
+building.
+
+**Run `code-monkey doctor` first in any session that uses the CLI or the MCP
+server.** More than one repository can build a binary of this name, from
+histories that are not related, and the failure is silent: a tool list that
+disagrees with the CLI, or a schema mismatch. `doctor` reports `built_from`,
+`commit` and `build=#N` for the running executable, for the checkout it is run
+against, and for the `code-monkey-mcp` peer beside it, and warns when they
+differ. It identifies the binary actually running; it does not scan `PATH`.
+
+---
+
+## Neighbours: `rg` and `fd`
+
+The index models **declarations** — names, kinds, containers, signatures, doc
+comments, `//# ai:` directives, imports, SPI groups, and call-site names. It
+stores bodies as byte offsets rather than text, and indexes only the Swift files
+under `sources`. Two classes of question therefore sit outside it at every tier:
+
+| Question | Tool | Why not the index |
+|---|---|---|
+| String literal, error message, magic number, `TODO`, any token inside a body | `rg` | no body text is stored — `query` cannot see inside a body |
+| Anything in `.toml`, `.md`, `.json`, fixtures, `Package.swift` | `rg` / `fd` | non-Swift and out-of-`sources` files are not indexed |
+| Does this file exist / what is its path for `--file` | `fd` | cheaper than a query, and sees unindexed files too |
+
+Note what is *not* on that list: `import` lines are indexed here, so use the
+`imports` command rather than `rg '^import '` — it carries `@_spi` groups and
+`@testable` marks that a text match cannot see.
+
+- **Structure → `code-monkey`.** What exists, where, what it's called, what
+  documents it, what reaches it.
+- **Text → `rg`.** What a body literally says.
+- **Files → `fd`.** What is on disk, indexed or not.
+
+```bash
+rg -n 'PRAGMA journal_mode' Sources           # a literal only a body can hold
+rg -l --type swift 'BEGIN IMMEDIATE'          # which files, not which lines
+rg -c 'ai:invariant' Sources                  # counts before reading anything
+fd -e swift . Sources                         # the file set on disk
+fd 'Get' -e swift                             # locate a file for `--file`
+fd -e md -d 1                                 # BOOK.md / sidecars `weave` reads
+```
+
+`rg` respects `.gitignore`, so `.build/` and `.code-monkey/` stay out without
+flags.
+
+### Hand rg's answer back to the index
+
+`rg` is a locator of last resort, not a reader. Its output is `file:line`;
+convert that to a `decl_id` and resume the tiered read rather than widening the
+match with `-A`/`-B`:
+
+```bash
+rg -n 'BEGIN IMMEDIATE' Sources               # → Sources/Database.swift:212
+code-monkey get --path Sources/Database.swift    # locate-only, find the owner
+code-monkey get Database.write --fields body --body-mode full
+```
+
+### Corroborating a graded call edge
+
+`calls` grades edges by name, not by type, so `low` and `medium` edges are
+leads. `rg` is the cheapest way to promote or kill one — and the required
+follow-up after `rename`, which reports call sites and never rewrites them.
+
+### Anti-patterns
+
+- `rg 'func '` to enumerate declarations — `get --kind func` is cheaper, exact,
+  and returns `decl_id`s.
+- `rg -A 40 'func createUser'` to read a body — that is `get --fields body`.
+- `rg` to find callers — that is `calls`; use `rg` only to grade its output.
+- `rg '^import '` — that is `imports`, which knows about SPI and `@testable`.
 
 ---
 
@@ -216,7 +297,7 @@ code-monkey index --check                          # stale-state report, no writ
 code-monkey index --full                           # rebuild from scratch
 ```
 
-`clip --paste-replacing` auto-refreshes the touched file. Manual edits require
+`clip`, `move` and `rename` auto-refresh the touched file. Manual edits require
 a manual `index`.
 
 Read commands open the existing index read-only and do not bootstrap or mutate schema metadata.
@@ -234,14 +315,78 @@ freshness diagnosis.
 
 ## Editing
 
-`clip` is write-only — it replaces a declaration, it does not read one. To
-read a decl's body, use `get --fields body`.
+`clip` is write-only — it writes a declaration, it does not read one. To read a
+decl's body, use `get --fields body`. Exactly one of `--paste-replacing`,
+`--paste-after`, `--paste-before` or `--cut` is required.
 
 ```bash
-# Stdin = new declaration including attrs/signature/body.
+# Stdin = declaration text including attrs/signature/body.
 code-monkey clip createUser --paste-replacing < new.swift
 code-monkey clip createUser --file Sources/UserService.swift --paste-replacing < new.swift  # disambiguate
+code-monkey clip createUser --paste-after < sibling.swift                                   # insert after
+code-monkey clip createUser --paste-before < sibling.swift                                  # insert before
+code-monkey clip createUser --cut > removed.swift                                           # delete, keeping source
 ```
+
+Resolution is two-tier, as in `get`: exact `decl_id` first, then
+`name`/`decl_id`/signature substring. The exact tier wins, so a container name
+targets the type itself, not its members — `clip Box --paste-replacing` replaces
+the whole of `Box`, and stdin must then carry every member. Multiple matches
+abort with the candidate list and nothing is written; narrow with `--file`.
+
+`--paste-after`/`--paste-before` insert stdin as a new decl beside the matched
+one, in the same scope — use them to add a member rather than rewriting its
+container. They re-indent stdin's first line to match the neighbouring decl,
+supply their own blank-line separator, and trim trailing newlines.
+`--paste-before` inserts *above the decl's doc comment*, not between a doc
+comment and the decl it describes.
+
+`--cut` deletes the decl together with its comment block and echoes the removed
+source to stdout, collapsing the blank lines around the hole. The payload is
+content-first (no leading indent), so it pastes straight back:
+
+```bash
+code-monkey clip Box.note --cut > removed.swift
+code-monkey clip Box.tail --paste-before < removed.swift   # exact restore
+```
+
+All four modes print status to **stderr**; stdout carries payload only, so
+`--cut`'s redirect captures exactly the removed source.
+
+`clip` writes at index-derived byte offsets, so it verifies the file's SHA-256
+against the one recorded at index time and refuses if they differ — an edit made
+outside `clip` shifts every later offset and would otherwise splice into the
+middle of a token. Run `code-monkey index` after any non-`clip` edit. There is no
+override.
+
+`decl_offset` is the declaration itself: attributes included, comments excluded
+(their text lives in `doc_comments`/`directives`). So `--paste-replacing` leaves
+the commentary above a decl alone — **and therefore its payload must not repeat
+the doc comment**, which would land under the existing one. `clip` refuses that;
+pass `--with-doc` to replace the comment block along with the decl, which is how
+a doc comment is edited through `clip`.
+
+---
+
+## Moving and renaming
+
+```bash
+code-monkey move "Box.note()" --to Sources/Other.swift               # append at end
+code-monkey move "Box.note()" --to Sources/Other.swift --after tag   # place precisely
+code-monkey rename "Box.note()" --to observe
+```
+
+`move` takes the decl **and its comment block**, closes up the source, and
+re-indents the block to its new nesting depth while preserving the nesting
+inside it. Use it instead of `--cut` + `--paste-after` across files. It does not
+check that the decl is legal at its destination, and the destination file must
+already exist.
+
+`rename` changes the **declaration only** and prints the call sites that may
+refer to it, with confidence grades. It never rewrites them: `call_sites` stores
+line numbers rather than byte offsets, and the edges are graded syntactic
+guesses, so an automatic update would rename unrelated code. Rename, read the
+list, then fix each site with `clip`.
 
 Before editing:
 1. `code-monkey get <id>` — read doc + `//# ai:` directives.
@@ -410,7 +555,12 @@ Concurrent appends use Swift `Mutex`, cross-process `flock`, and `O_APPEND`.
 - **`no decl: X`** — index missing or stale. Run `code-monkey index`.
 - **`ambiguous (N matches)`** — same name in multiple files OR overloaded
   signature. Use exact `decl_id` (with arg types) or `--file`.
-- **`clip is write-only`** — you tried to read with `clip`. Use `get --fields body` instead.
+- **`clip is write-only`** — you tried to read with `clip`, or passed no mode
+  flag. Use `get --fields body` to read.
+- **`... changed since it was indexed`** — the file was edited outside `clip`.
+  Run `code-monkey index` and retry; nothing was written.
+- **tools that don't exist, or a schema you didn't write** — you are talking to a
+  binary built from another checkout. Run `doctor` and read `built_from`.
 - **`only SELECT/WITH/PRAGMA allowed`** — `query` is read-only.
 - **`UNIQUE constraint failed`** — pre-fix schema; run `rm -rf .code-monkey/` then `index`.
 - **`index schema is version N, expected M`** — the index predates the current
@@ -424,7 +574,8 @@ Concurrent appends use Swift `Mutex`, cross-process `flock`, and `O_APPEND`.
 ```
 init        write .code-monkey.toml + .code-monkey/
 index       full or incremental build (--full to rebuild, --check for stale report, no writes)
-doctor      executable/index/schema/WAL/audit/freshness diagnostics
+doctor      provenance (built_from/commit/build #, MCP peer)
+            + index/schema/WAL/audit/freshness diagnostics
 
 get         field-selectable read; bare positional resolves one record,
             any of --path/--kind/--container/--name-like/--tag/--spi enumerates
@@ -447,7 +598,12 @@ calls       call tree: who reaches a decl (default) or what it reaches (--callee
             --tests                     only branches reaching a test ("what covers this?")
             --summary                   blast-radius block instead of the tree
 
-clip        write-only: --paste-replacing <decl_id/name> (--file to disambiguate)
+clip        write-only: --paste-replacing [--with-doc] | --paste-after
+                      | --paste-before | --cut   <decl_id/name>
+            (--file to disambiguate)
+            status on stderr; --cut echoes removed source to stdout
+move        relocate a decl + comment block: --to <file> [--after <decl>]
+rename      rename a decl: --to <identifier>; refs reported, not rewritten
 query       read-only SQL
 weave       Markdown literate projection
 imports     import lines with their @_spi groups and @testable marks
@@ -456,4 +612,10 @@ file        sandbox-escape read/write/append/log
 version     build info
 ```
 
+```
+rg          body text and non-Swift files — what the index omits
+fd          file discovery, including files outside `sources`
+```
+
 Always prefer the cheapest read that answers the question. Climb deliberately.
+Structure through `code-monkey`; text through `rg`; files through `fd`.

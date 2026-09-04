@@ -51,9 +51,6 @@ struct ToolPolicy: Sendable {
         // The config setting is the right default and the flag pair is a two-property way to
         // say one thing; a client that wants call sites off should edit `.code-monkey.toml`.
         case "code_monkey_index": alwaysHidden.union(["call_sites", "no_call_sites"])
-        // Required by the CLI to make a destructive write explicit. There is no read mode to
-        // choose between here, so the client would only ever be able to get it wrong.
-        case "code_monkey_clip": alwaysHidden.union(["paste_replacing"])
         // This tool's contract is the JSON envelope, and `--format json` is injected to get it.
         // Advertising `format` would offer a choice the injected flag then overrides.
         case "code_monkey_get": alwaysHidden.union(["format"])
@@ -73,21 +70,25 @@ struct ToolPolicy: Sendable {
         "code_monkey_calls": ["--json"],
         "code_monkey_query": ["--json"],
         "code_monkey_imports": ["--json"],
-        "code_monkey_clip": ["--paste-replacing"],
     ]
 
     /// Payload delivered on standard input rather than as an argument, because it is a file's
     /// or a declaration's whole text and has no business on a command line.
     func stdinArgument(for tool: String) -> ExtraArgument? {
         switch tool {
+        // Not required: `cut` removes a declaration and reads nothing. Which modes need a
+        // payload is a rule between arguments, and the schema has no way to say it — the CLI
+        // refuses an empty payload itself, with a better message than a schema could give.
         case "code_monkey_clip":
             ExtraArgument(
                 key: "new_body",
                 schema: .object([
                     "type": .string("string"),
-                    "description": .string("Full replacement declaration text (attributes, signature, body)."),
+                    "description": .string(
+                        "Declaration text (attributes, signature, body). Required by "
+                            + "paste_replacing, paste_after and paste_before; ignored by cut."),
                 ]),
-                isRequired: true)
+                isRequired: false)
         case "code_monkey_file_write", "code_monkey_file_append":
             ExtraArgument(
                 key: "content",
@@ -138,8 +139,9 @@ struct ToolPolicy: Sendable {
         /// it is replacing — or fall back to reading the whole file, which is the thing this
         /// tool exists to avoid.
         //# ai:invariant: write is a superset of read
+        //# ai:invariant: every command that writes source belongs here, or the profile lies
         static let write: Set<String> = read.union([
-            "code_monkey_clip",
+            "code_monkey_clip", "code_monkey_move", "code_monkey_rename",
             "code_monkey_file_read", "code_monkey_file_write",
             "code_monkey_file_append", "code_monkey_file_log",
         ])
