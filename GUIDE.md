@@ -48,6 +48,14 @@ Verify:
 code-monkey --help
 ```
 
+The DocC catalog in `Sources/code-monkey/Documentation.docc/` covers the same
+ground as this guide, as a browsable archive:
+
+```bash
+make docs             # writes .build/docs
+make docs-preview     # serves it locally
+```
+
 ---
 
 ## First run, on any Swift project
