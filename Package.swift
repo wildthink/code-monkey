@@ -13,6 +13,9 @@ let package = Package(
         // way ArgumentParser does, naming the bad value. 2.0.0 compiles against the same call
         // and prints a bare help screen instead, so the wrong version fails silently.
         .package(url: "https://github.com/wildthink/LineEditor.git", from: "2.0.1"),
+        // Documentation only: `swift package generate-documentation` builds the
+        // Documentation.docc catalog. It contributes nothing to the built binaries.
+        .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.4.0"),
     ],
     targets: [
         .executableTarget(

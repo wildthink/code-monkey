@@ -55,8 +55,21 @@ uninstall:
 	rm -f $(PREFIX)/code-monkey-mcp
 	rm -f $(PREFIX)/.code-monkey-build.json
 
+# The catalog documents an executable target, where nothing is `public`. Without
+# the access-level floor DocC would extract an empty symbol graph and the
+# articles would have no module to attach to.
+DOCC_FLAGS := --target code-monkey --symbol-graph-minimum-access-level internal
+
+docs:
+	swift package --allow-writing-to-directory .build/docs \
+		generate-documentation $(DOCC_FLAGS) --output-path .build/docs
+
+docs-preview:
+	swift package --disable-sandbox preview-documentation $(DOCC_FLAGS)
+
 clean:
 	rm -f $(BUILDINFO) $(SEQ_FILE)
+	rm -rf .build/docs
 	swift package clean
 
-.PHONY: install build hooks unhooks uninstall clean
+.PHONY: install build hooks unhooks uninstall docs docs-preview clean
