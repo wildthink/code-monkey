@@ -32,7 +32,13 @@ build: $(BUILDINFO)
 # Regenerated only when real sources change, so unrelated `make build` runs
 # don't touch BuildInfo.swift's mtime and force a needless recompile/relink,
 # and the build seq only bumps on builds that actually have something to build.
-$(BUILDINFO): $(SOURCES)
+#
+# The Makefile is a prerequisite because VERSION lives here and nowhere else.
+# Without it a version bump never reached the binary: no .swift file changes
+# when you edit this line, so the stamp stayed current and `code-monkey version`
+# kept printing the old number until some unrelated source happened to change.
+# This file changes rarely, so it costs a relink about as often as a release.
+$(BUILDINFO): $(SOURCES) Makefile
 	@n=$$(cat $(SEQ_FILE) 2>/dev/null || echo 0); \
 	n=$$((n + 1)); \
 	echo $$n > $(SEQ_FILE); \
