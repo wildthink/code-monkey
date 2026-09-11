@@ -9,7 +9,46 @@ dispatch bridging) and the `--profile` / `--tests` / `--summary` additions.
 
 ---
 
-## 1. `pr_context` — one-call change analysis
+## 1. `pr_context` — one-call change analysis — **mostly done** (2026-09-11)
+
+**Shipped as `stats --section delta` / `--section volatility`**, plus
+`--format dashboard`. Not a separate command: a new MCP tool costs its whole
+description in every request, and these are cuts of the same report.
+
+**Actual LOE: ~1 day** for both sections, the git layer, the dashboard
+projection, and 15 tests. The estimate below was close on effort and right
+about every risk, so the reasoning is left intact.
+
+Four things landed differently than the entry anticipated:
+
+- **No worktree, no re-index.** `git diff -U0` reports hunks in *current-file*
+  coordinates, so they join straight onto `declarations.start_line`. Prior state
+  comes from `git show` piped through `Extractor` in-process, for the changed
+  files only. The obvious approach — check the ref out and index it — was never
+  needed.
+- **The staleness trap is a warning, not a hard error.** The entry called for a
+  hard error. In practice `delta` is most useful on a tree you are still
+  editing, and refusing to run would make it useless exactly then. It says so
+  loudly instead, alongside two other cases that would otherwise read as a
+  confident zero: no repository, and a shallow clone.
+- **Blast radius stayed out.** `hotspots` already reports corroborated fan-in;
+  crossing it with the delta is Tier B below.
+- **Classification follows `decl_id`**, which carries parameter labels and types
+  but not the return type. So renaming a parameter reads as a removal plus an
+  addition rather than a signature change, because `get` can no longer reach the
+  old handle.
+
+The subprocess question below was the real decision, and it went the way the
+entry framed it: deliberately, in one file, with the three failure modes
+enumerated. Standard error goes to the null device on purpose — draining one
+pipe while git fills another deadlocks once the unread one fills.
+
+**Still open:** the commit-message scope suggestion, and test coverage per
+changed declaration. Neither has been asked for.
+
+<details>
+<summary>Original entry, 2026-08-24</summary>
+
 
 **What.** `git diff` against a base branch → changed declarations → their blast
 radius, which of them are covered by tests, which are public API, a suggested
@@ -40,6 +79,41 @@ the stale/modified/unindexed split, so wire it as a hard error, not a warning.
 
 **Decide it separately** from the rest of this list. It is the only item that
 changes what kind of program `code-monkey` is.
+
+</details>
+
+---
+
+## 1b. Declaration-level history — deferred (2026-09-11)
+
+**What.** Per-declaration volatility rather than per-file: how many commits have
+touched *this* function, by how many authors, and when last. The drill-down
+`stats --section volatility` currently stops one level short of.
+
+**LOE: 1–1.5 days.** The mechanism is `git log -L <start>,<end>:<file>`, which
+follows a line range backwards through history and is the only thing that gets
+this right — hunk line numbers from an old commit do not map onto today's
+declarations, and pretending they do silently attributes edits to whichever
+declaration happens to occupy those lines now.
+
+**Why it is a separate tier.** Measured at **42ms per declaration**. This
+project has 1263 of them, so a whole-project pass is roughly 50 seconds against
+the ~80ms one `git log --numstat` costs for every file at once. It can only ever
+run over a shortlist — and the shortlist already comes from the file-level
+sections that shipped, which is why those came first.
+
+**What it needs beyond the git call.** A cache, or it will feel broken. Key it
+on the declaration plus the file blob sha plus HEAD, so an unchanged declaration
+is computed once and a rebased branch invalidates cleanly. That is a schema
+bump, and there is no migration path — a version bump means `index --full`.
+
+**Worth building when** someone asks *why* a file is hot and the answer needs to
+name a function. Until then the file-level answer is the one people act on, and
+it is free.
+
+**Not worth pairing with** a tool-owned snapshot table that records declaration
+hashes on every `index`. That was costed at ~2 days and rejected: it duplicates
+what git already knows, and it starts empty, so it delivers nothing for months.
 
 ---
 
