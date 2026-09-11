@@ -648,9 +648,53 @@ alone, without opening a source file.
 | `docs` | doc coverage by access, directive tags, files no section claims |
 | `coupling` | most-imported modules, most-conformed protocols |
 | `hotspots` | longest bodies, and undocumented names with the widest fan-in |
+| `delta` | what changed since a git ref, classified per declaration |
+| `volatility` | churn, authors and age per file over a window |
 
 `--section` is repeatable and narrows the work as well as the output: a section
 nobody asked for runs no query.
+
+#### History sections
+
+`delta` and `volatility` are the only part of the tool that shells out. Every
+other section reads the index alone, and without a repository these two are
+skipped with a warning while the rest of the report still runs.
+
+```bash
+code-monkey stats --section delta                    # uncommitted work
+code-monkey stats --section delta --since main       # this branch against main
+code-monkey stats --section volatility --window 30   # the last month's churn
+```
+
+`delta` names declarations, not lines. It classifies each one `added`, `removed`,
+`signature` or `body`, and reports the two counts a line diff cannot: how many
+touched declarations sit behind an `ai:invariant` or `ai:warn`, and how many
+added or removed declarations are `public`.
+
+The split follows `decl_id`, which carries parameter labels and types but not the
+return type or `throws`. Renaming a parameter therefore retires one handle and
+introduces another, and is reported as a removal plus an addition rather than a
+signature change — which is the truth a caller needs, because `get` can no longer
+reach the old handle.
+
+Two situations would otherwise produce a confidently wrong answer, so both are
+warnings. A **stale index** makes `delta` compare git against a tree that no
+longer exists. A **shallow clone** has no history to measure, and silence there
+would read as "nothing has changed".
+
+#### Dashboard output
+
+```bash
+code-monkey stats --format dashboard --since main
+```
+
+Same figures, reshaped into one flat entity array with metric descriptors and
+sparkline series. Files and declarations share the array; a declaration carries
+a `parent` pointing at its file entity, so drill-down is a filter rather than a
+join. Values stay numbers so a table can sort them, and `metrics` says the unit
+and which direction is worse, so a UI colours columns without hardcoding a list.
+Flags carry the editorial layer (`hot`, `thin-docs`, `unmapped`, `dormant`,
+`review`) instead of collapsing into one opaque score.
 
 Three figures carry caveats. `span` nests, so a struct's span covers its members
 and the column does not sum to a file total. Byte totals count top-level
@@ -1265,7 +1309,7 @@ get         field-selectable read; bare positional resolves one record,
             --limit/--offset            (enumerate mode)
 clip        write-only: --paste-replacing <decl_id/name> (--file to disambiguate)
 query       read-only SELECT/WITH/PRAGMA
-stats       project shape (--section, --top, <path>)
+stats       project shape (--section, --top, --since, --window, --format, <path>)
 weave       Markdown literate projection (--summary, --section, --access, --spi)
 imports     import lines + their @_spi groups (--module, --spi, --testable)
 file        sandbox-escape read/write/append/log

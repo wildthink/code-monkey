@@ -23,6 +23,8 @@ enum Stats {
         case docs
         case coupling
         case hotspots
+        case delta
+        case volatility
 
         var summary: String {
             switch self {
@@ -33,6 +35,8 @@ enum Stats {
             case .docs: "doc-comment coverage by access, directive tags, unmapped files"
             case .coupling: "most-imported modules, most-conformed protocols"
             case .hotspots: "longest bodies, and undocumented names with the widest fan-in"
+            case .delta: "what changed since a git ref, per declaration (needs git)"
+            case .volatility: "churn, authors and age per file over a window (needs git)"
             }
         }
 
@@ -51,6 +55,9 @@ enum Stats {
     struct Scope {
         var clause: String = "1=1"
         var binds: [any Bindable] = []
+        /// The same restriction as `clause`, for the sections that filter git's answer in Swift
+        /// rather than SQL. Nil means the whole project.
+        var pathPrefix: String?
 
         init(path: String?, root: URL) {
             guard let path else { return }
@@ -58,6 +65,7 @@ enum Stats {
             guard !rel.isEmpty else { return }
             clause = "(f.path = ? OR f.path LIKE ?)"
             binds = [rel, rel + "/%"]
+            pathPrefix = rel
         }
     }
 
@@ -92,6 +100,8 @@ enum Stats {
 extension Stats {
     struct Report: Encodable {
         var scope: String
+        var as_of: AsOf?
+        var warnings: [String] = []
         var overview: Overview?
         var kinds: [KindStat]?
         var mass: Mass?
@@ -99,6 +109,8 @@ extension Stats {
         var docs: Docs?
         var coupling: Coupling?
         var hotspots: Hotspots?
+        var delta: Delta?
+        var volatility: Volatility?
     }
 
     struct Overview: Encodable {
@@ -215,7 +227,12 @@ extension Stats {
         root: URL,
         path: String?,
         sections: Set<Section>,
-        top: Int
+        top: Int,
+        since: String? = nil,
+        windowDays: Int = 90,
+        buckets: Int = 12,
+        indexIsStale: Bool = false,
+        now: Date = Date()
     ) async throws -> Report {
         let scope = Scope(path: path, root: root)
         var report = Report(scope: path ?? ".")
@@ -478,6 +495,52 @@ extension Stats {
             )
         }
 
+        // History last, and only when asked: it is the one part that leaves the process.
+        let wantsHistory = sections.contains(.delta) || sections.contains(.volatility)
+        if wantsHistory {
+            let iso = ISO8601DateFormatter()
+            guard let repo = try Git.discover(root: root) else {
+                report.warnings.append(
+                    "no git repository at \(root.path); `delta` and `volatility` need one")
+                return report
+            }
+            if repo.isShallow {
+                // Silence here would read as "nothing has changed", which is the most dangerous
+                // wrong answer this command can give: a depth-1 CI checkout has no history at all.
+                //# ai:warn: never let a shallow clone report as a quiet zero
+                report.warnings.append(
+                    "shallow clone: history is truncated, so churn and age are lower bounds")
+            }
+            let ref = since ?? "HEAD"
+            let sha = try Git.resolve(ref: ref, in: repo)
+            if sha == nil {
+                report.warnings.append("unknown git ref `\(ref)`; skipping delta")
+            }
+            // The delta reads one side from git and the other from the index. A stale index
+            // makes it describe a working tree that no longer exists, and every figure in the
+            // section is wrong in a way none of them can show.
+            //# ai:invariant: a stale index must never produce a silent delta
+            if indexIsStale, sections.contains(.delta) {
+                report.warnings.append(
+                    "index is stale, so `delta` compares git against an old snapshot; run index first")
+            }
+            report.as_of = AsOf(
+                generated_at: iso.string(from: now),
+                head: String(repo.head.prefix(7)),
+                since_ref: sections.contains(.delta) ? ref : nil,
+                since_sha: sha.map { String($0.prefix(7)) },
+                window_days: sections.contains(.volatility) ? windowDays : nil)
+
+            if sections.contains(.delta), sha != nil {
+                report.delta = try await delta(db: db, repo: repo, ref: ref, scope: scope, top: top)
+            }
+            if sections.contains(.volatility) {
+                report.volatility = try await volatility(
+                    db: db, repo: repo, scope: scope,
+                    days: windowDays, buckets: buckets, top: top, now: now)
+            }
+        }
+
         return report
     }
 }
@@ -537,12 +600,47 @@ extension Stats {
                 + ["protocol\tconformances"]
                 + c.protocols.map { "\($0.name)\t\($0.count)" })
         }
+        if let d = report.delta {
+            var head = [
+                "since=\(report.as_of?.since_ref ?? "?") (\(report.as_of?.since_sha ?? "?")) "
+                    + "head=\(report.as_of?.head ?? "?") files_changed=\(d.files_changed)",
+                "added=\(d.added) removed=\(d.removed) "
+                    + "signature=\(d.signature_changed) body=\(d.body_changed)",
+                "api_added=\(d.api_added) api_removed=\(d.api_removed) "
+                    + "guarded=\(d.guarded_changed) undocumented=\(d.undocumented_changed)",
+            ]
+            if !d.changes.isEmpty {
+                head.append("")
+                head.append("change\tlines\taccess\tdecl_id\tlocation")
+                head.append(contentsOf: d.changes.map { c in
+                    let marks = (c.guards.isEmpty ? "" : " !guarded")
+                        + (c.documented || c.change == "removed" ? "" : " !undocumented")
+                    let where_ = c.line.map { "\(c.path):\($0)" } ?? c.path
+                    return "\(c.change)\t\(c.lines_touched)\t\(c.access)\t\(c.decl_id)\t\(where_)\(marks)"
+                })
+            }
+            section("delta", head)
+        }
+        if let v = report.volatility {
+            section("volatility", [
+                "window=\(v.window_days)d bucket=\(v.bucket) files_changed=\(v.files_changed) "
+                    + "commits=\(v.commits) authors=\(v.authors)",
+                "churn\tcommits\tage\tpath\tflags",
+            ] + v.files.map { f in
+                let age = f.age_days.map { "\($0)d" } ?? "-"
+                let flags = f.flags.isEmpty ? "" : f.flags.joined(separator: ",")
+                return "\(f.churn)\t\(f.commits)\t\(age)\t\(f.path)\t\(flags)"
+            })
+        }
         if let h = report.hotspots {
             section("hotspots", ["decl_id\tkind\tspan\tlocation"]
                 + h.longest_bodies.map { "\($0.decl_id)\t\($0.kind)\t\($0.span)\t\($0.path):\($0.start_line)" }
                 + [""]
                 + ["callers\tundocumented decl_id\tfile"]
                 + h.undocumented_fan_in.map { "\($0.callers)\t\($0.decl_id)\t\($0.path)" })
+        }
+        if !report.warnings.isEmpty {
+            section("warnings", report.warnings)
         }
         return out.joined(separator: "\n")
     }
@@ -566,6 +664,12 @@ struct StatsCmd: AsyncParsableCommand {
           docs       doc coverage by access, directive tags, files no section claims
           coupling   most-imported modules, most-conformed protocols
           hotspots   longest bodies, and undocumented names with the widest fan-in
+          delta      what changed since a git ref, classified per declaration
+          volatility churn, authors and age per file over a window
+
+        The last two shell out to git; every other section reads the index alone. Without a         repository they are skipped with a warning and the rest of the report still runs.         `delta` reads one side from git and the other from the index, so run `index` first: a         stale index makes it describe a tree that no longer exists, and it says so when it can         tell. On a shallow clone history is truncated, which would otherwise read as a quiet         zero, so that is a warning too.
+
+        `--format dashboard` emits the same figures as one flat entity array with metric         descriptors and sparkline series, for a UI to sort and filter rather than a person to         read. It is always JSON, and it turns on the sections its entities come from.
 
         Three figures carry caveats worth knowing before you quote them. `span` nests, so a \
         struct's span covers its members and the column does not sum to a file total. Byte \
@@ -579,6 +683,11 @@ struct StatsCmd: AsyncParsableCommand {
           code-monkey stats --section fold             the case for reading at level 0
           code-monkey stats --section docs             where the prose is missing
           code-monkey stats Sources/code-monkey        narrow to a subtree
+
+          code-monkey stats --section delta                    uncommitted work
+          code-monkey stats --section delta --since main       this branch against main
+          code-monkey stats --section volatility --window 30   the last month's churn
+          code-monkey stats --format dashboard --since main    JSON for a UI
         """)
 
     @OptionGroup var opts: GlobalOptions
@@ -589,26 +698,79 @@ struct StatsCmd: AsyncParsableCommand {
 
     @Option(name: .long, help: "Rows per ranked list.") var top: Int = 10
 
+    @Option(name: .long, help: "Git ref `delta` compares against. Default HEAD: uncommitted work.")
+    var since: String?
+
+    @Option(name: .long, help: "Days of history the `volatility` section covers.")
+    var window: Int = 90
+
+    @Option(name: .long, help: "Sparkline buckets across the window.")
+    var buckets: Int = 12
+
+    @Option(name: .long, help: "Output shape. `dashboard` is one flat entity array, always JSON.")
+    var format: StatsFormat = .report
+
     func validate() throws {
         guard top > 0 else { throw ValidationError("--top must be at least 1") }
+        guard window > 0 else { throw ValidationError("--window must be at least 1 day") }
+        guard buckets > 0, buckets <= 96 else { throw ValidationError("--buckets must be 1...96") }
     }
 
     mutating func run() async throws {
-        let requested = section.isEmpty ? Set(Stats.Section.allCases) : Set(section)
+        // The dashboard projection is built from files and declarations, so it needs the two
+        // sections that produce them however narrow a `--section` the caller passed.
+        //# ai:invariant: --format dashboard implies the sections its entities are drawn from
+        var requested = section.isEmpty ? Set(Stats.Section.allCases) : Set(section)
+        if format == .dashboard { requested.formUnion([.mass, .volatility, .delta]) }
+
         let (project, db, _) = try await opts.openIndex(
             command: "stats", tier: "T0",
             target: path ?? (section.isEmpty ? "all" : section.map(\.rawValue).joined(separator: ",")))
         let freshness = try await Indexer.check(project: project, db: db)
         let report = try await Stats.report(
-            db: db, root: project.root, path: path, sections: requested, top: top)
+            db: db, root: project.root, path: path, sections: requested, top: top,
+            since: since, windowDays: window, buckets: buckets,
+            indexIsStale: freshness.needsRefresh)
+
+        if format == .dashboard {
+            let asOf = report.as_of ?? Stats.AsOf(
+                generated_at: ISO8601DateFormatter().string(from: Date()),
+                head: "-", since_ref: nil, since_sha: nil, window_days: window)
+            // Always JSON: a flat entity list exists to be consumed by a UI, and there is no
+            // text rendering of it that a person would rather read than the report.
+            Printer.emit(Stats.dashboard(from: report, asOf: asOf),
+                         json: true, tier: "T0",
+                         resultCount: requested.count,
+                         warnings: report.warnings,
+                         freshness: freshness.needsRefresh ? "stale" : "fresh") { "" }
+            return
+        }
+
         Printer.emit(
             report,
             json: opts.json,
             tier: "T0",
             resultCount: requested.count,
+            warnings: report.warnings,
             freshness: freshness.needsRefresh ? "stale" : "fresh"
         ) {
             Stats.render(report)
         }
+    }
+}
+
+/// How the report leaves the process.
+///
+/// `report` is sectioned for a reader; `dashboard` is one flat entity array for a UI. They carry
+/// the same figures, so this is a projection rather than a second set of metrics.
+enum StatsFormat: String, CaseIterable, Sendable, ExpressibleByArgument {
+    case report
+    case dashboard
+
+    static var allValueDescriptions: [String: String] {
+        [
+            "report": "sectioned, for a reader; honours --json",
+            "dashboard": "one flat entity array with metric descriptors; always JSON",
+        ]
     }
 }

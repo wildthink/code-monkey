@@ -27,7 +27,9 @@ struct ToolPolicy: Sendable {
     /// Integers. The tool info schema carries no value types at all, so this is the one gap that
     /// cannot be closed by reading harder.
     //# ai:invariant: every `Int`/`Int?` option in the CLI appears here, or it types as a string
-    let integerArguments: Set<String> = ["limit", "offset", "depth", "level", "last"]
+    let integerArguments: Set<String> = [
+        "limit", "offset", "depth", "level", "last", "top", "window", "buckets",
+    ]
 
     /// Options whose single string holds a comma-separated list. Such a value can never satisfy
     /// a JSON Schema `enum` over its members, so these are treated as open sets too.

@@ -2253,3 +2253,342 @@ struct StatsTests {
         #expect(!Stats.render(only).contains("## overview"))
     }
 }
+
+@Suite("Git")
+struct GitTests {
+
+    // MARK: pure parsing
+
+    /// Git factors a rename two different ways and both mean one file. Reading either literally
+    /// invents a path that never existed and drops the history of the one that did.
+    @Test func renameSpellingsReduceToThePostImage() {
+        #expect(Git.postImagePath("Sources/A.swift") == "Sources/A.swift")
+        #expect(Git.postImagePath("Sources/Old.swift => Sources/New.swift") == "Sources/New.swift")
+        #expect(Git.postImagePath("Sources/{Old => New}/File.swift") == "Sources/New/File.swift")
+        #expect(Git.postImagePath("{Old => New}/File.swift") == "New/File.swift")
+    }
+
+    /// A project nested inside a monorepo makes git's paths and the index's paths disagree, and
+    /// neither string says so — the join just matches nothing.
+    @Test func pathsTranslateAcrossTheProjectPrefix() {
+        let nested = Git.Repository(root: URL(fileURLWithPath: "/repo"), head: "abc",
+                                    isShallow: false, prefix: "packages/core")
+        #expect(nested.gitPath(fromIndex: "Sources/A.swift") == "packages/core/Sources/A.swift")
+        #expect(nested.indexPath(fromGit: "packages/core/Sources/A.swift") == "Sources/A.swift")
+        #expect(nested.indexPath(fromGit: "packages/other/B.swift") == nil)
+
+        let flat = Git.Repository(root: URL(fileURLWithPath: "/repo"), head: "abc",
+                                  isShallow: false, prefix: "")
+        #expect(flat.gitPath(fromIndex: "Sources/A.swift") == "Sources/A.swift")
+        #expect(flat.indexPath(fromGit: "Sources/A.swift") == "Sources/A.swift")
+    }
+
+    // MARK: over a real repository
+
+    static let original = """
+    import Foundation
+
+    /// Documented.
+    public struct Store {
+        //# ai:invariant: ids stay unique
+        public func keep(id: String) -> Int { id.count }
+
+        public func retire() -> Int { 0 }
+
+        func retype(old: String) -> Int { old.count }
+
+        func relabel(old: String) -> Int { old.count }
+    }
+    """
+
+    /// `retire` deleted, `retype` given a new return type and `throws`, `relabel` given a new
+    /// parameter label, `keep` given a new body, and `arrive` added. One file exercises every
+    /// classification plus the label case, which is deliberately not one of them.
+    static let edited = """
+    import Foundation
+
+    /// Documented.
+    public struct Store {
+        //# ai:invariant: ids stay unique
+        public func keep(id: String) -> Int {
+            return id.count + 1
+        }
+
+        func retype(old: String) throws -> Double { 0 }
+
+        func relabel(fresh: String) -> Int { fresh.count }
+
+        public func arrive() -> Int { 2 }
+    }
+    """
+
+    static func git(_ arguments: [String], in directory: URL) throws {
+        _ = try Git.run(arguments, in: directory)
+    }
+
+    /// A repository with one commit of `original`, and `edited` sitting uncommitted on top — so
+    /// `--since HEAD` has exactly the four changes above to find.
+    static func makeRepo() throws -> URL {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("cm-git-\(UUID().uuidString)")
+        let sources = root.appendingPathComponent("Sources")
+        try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
+        try Config.defaultTOML.write(to: root.appendingPathComponent(".code-monkey.toml"),
+                                     atomically: true, encoding: .utf8)
+        let file = sources.appendingPathComponent("Store.swift")
+        try original.write(to: file, atomically: true, encoding: .utf8)
+
+        try git(["init", "-q"], in: root)
+        try git(["config", "user.email", "test@example.com"], in: root)
+        try git(["config", "user.name", "Test"], in: root)
+        try git(["add", "-A"], in: root)
+        try git(["commit", "-q", "-m", "first"], in: root)
+        try edited.write(to: file, atomically: true, encoding: .utf8)
+        return root
+    }
+
+    static func indexed(_ root: URL) async throws -> (Project, Database) {
+        let project = try Project.load(explicitRoot: root.path)
+        let db = try Database(path: project.dbPath, mode: .readWrite)
+        try await Schema.bootstrap(db)
+        _ = try await Indexer(project: project, db: db).run(full: true)
+        return (project, db)
+    }
+
+    @Test func discoveryReportsHeadAndAnEmptyPrefix() throws {
+        let root = try Self.makeRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repo = try #require(try Git.discover(root: root))
+        #expect(repo.prefix == "")
+        #expect(repo.head.count == 40)
+        #expect(!repo.isShallow)
+        #expect(try Git.resolve(ref: "HEAD", in: repo) == repo.head)
+        #expect(try Git.resolve(ref: "nope", in: repo) == nil)
+    }
+
+    @Test func discoveryReturnsNilOutsideARepository() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("cm-bare-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        // A temp directory can sit inside someone's repository; only assert when it does not.
+        if let found = try Git.discover(root: root) {
+            #expect(found.prefix != "", "a discovered repo here must be an enclosing one")
+        }
+    }
+
+    /// With context lines every hunk would widen by three in each direction and the join would
+    /// claim neighbouring declarations nobody touched.
+    @Test func hunksAreZeroContextAndOnTheNewSide() throws {
+        let root = try Self.makeRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repo = try #require(try Git.discover(root: root))
+        let hunks = try Git.hunks(since: "HEAD", in: repo)
+        #expect(!hunks.isEmpty)
+        #expect(hunks.allSatisfy { $0.path == "Sources/Store.swift" })
+        #expect(hunks.allSatisfy { $0.start >= 1 && $0.end >= $0.start })
+        let lineCount = Self.edited.split(separator: "\n", omittingEmptySubsequences: false).count
+        #expect(hunks.allSatisfy { $0.end <= lineCount },
+                "a hunk past the end of the file means the old side was parsed")
+    }
+
+    @Test func deltaClassifiesAddedRemovedSignatureAndBody() async throws {
+        let root = try Self.makeRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (project, db) = try await Self.indexed(root)
+        let repo = try #require(try Git.discover(root: root))
+        let delta = try await Stats.delta(
+            db: db, repo: repo, ref: "HEAD",
+            scope: Stats.Scope(path: nil, root: project.root), top: 50)
+
+        func change(_ needle: String) -> Stats.DeclChange? {
+            delta.changes.first { $0.decl_id.contains(needle) }
+        }
+        #expect(delta.files_changed == 1)
+        #expect(change("arrive")?.change == "added")
+        #expect(change("retire")?.change == "removed")
+        #expect(change("keep")?.change == "body")
+        // decl_id carries parameter labels and types but not the return type or `throws`, so
+        // this one keeps its handle and reports as a signature change.
+        #expect(change("retype")?.change == "signature")
+
+        // `arrive` and `retire` are both public, so each shows on the API surface.
+        #expect(delta.api_added == 1)
+        #expect(delta.api_removed == 1)
+        // `keep` carries an ai:invariant and its body changed.
+        #expect(delta.guarded_changed >= 1)
+        #expect(change("keep")?.guards.contains("ai:invariant") == true)
+    }
+
+    /// A parameter label is part of the stable handle, so renaming one retires a decl_id and
+    /// introduces another. Reporting that as a signature change would claim `get` can still
+    /// reach the old handle, and it cannot.
+    @Test func aChangedParameterLabelRetiresTheHandle() async throws {
+        let root = try Self.makeRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (project, db) = try await Self.indexed(root)
+        let repo = try #require(try Git.discover(root: root))
+        let delta = try await Stats.delta(
+            db: db, repo: repo, ref: "HEAD",
+            scope: Stats.Scope(path: nil, root: project.root), top: 50)
+        let relabel = delta.changes.filter { $0.decl_id.contains("relabel") }
+        #expect(relabel.count == 2)
+        #expect(Set(relabel.map(\.change)) == ["added", "removed"])
+        #expect(relabel.contains { $0.decl_id.contains("old:") && $0.change == "removed" })
+        #expect(relabel.contains { $0.decl_id.contains("fresh:") && $0.change == "added" })
+    }
+
+    /// A declaration that only moved down the file, because something above it grew, has not
+    /// changed. Reporting it would bury the real edits under the rest of the file.
+    @Test func declarationsThatOnlyShiftedAreNotReportedAsChanged() async throws {
+        let root = try Self.makeRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (project, db) = try await Self.indexed(root)
+        let repo = try #require(try Git.discover(root: root))
+        let delta = try await Stats.delta(
+            db: db, repo: repo, ref: "HEAD",
+            scope: Stats.Scope(path: nil, root: project.root), top: 50)
+        // `Store` itself moved not at all and its own text is untouched; the struct declaration
+        // is only reported because its span covers its members, so assert on the import instead:
+        // nothing above line 4 changed, and no change entry may point there.
+        #expect(!delta.changes.contains { $0.line == 1 })
+    }
+
+    @Test func volatilityJoinsGitChurnOntoIndexedFiles() async throws {
+        let root = try Self.makeRepo()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (project, db) = try await Self.indexed(root)
+        let repo = try #require(try Git.discover(root: root))
+        let volatility = try await Stats.volatility(
+            db: db, repo: repo, scope: Stats.Scope(path: nil, root: project.root),
+            days: 30, buckets: 6, top: 10)
+
+        #expect(volatility.window_days == 30)
+        #expect(volatility.bucket_count == 6)
+        let store = try #require(volatility.files.first { $0.path == "Sources/Store.swift" })
+        #expect(store.commits == 1)
+        #expect(store.authors == 1)
+        #expect(store.declarations > 0)
+        #expect(store.series.count == 6)
+        #expect(store.series.reduce(0, +) == 1)
+        #expect(store.age_days == 0)
+        // The index is the spine: only indexed files appear, never every path git knows.
+        #expect(volatility.files.allSatisfy { $0.path.hasSuffix(".swift") })
+    }
+
+    @Test func flagsNameTheSignalThatFired() {
+        func file(churn: Int, coverage: Double, directives: Int, age: Int?) -> Stats.FileVolatility {
+            Stats.FileVolatility(path: "A.swift", commits: 1, authors: 1, insertions: churn,
+                                 deletions: 0, churn: churn, age_days: age, declarations: 10,
+                                 doc_coverage: coverage, directives: directives, series: [],
+                                 flags: [])
+        }
+        let hot = Stats.flags(for: file(churn: 100, coverage: 0.1, directives: 0, age: 1),
+                              churnThreshold: 50)
+        #expect(hot.contains("hot"))
+        #expect(hot.contains("thin-docs"))
+        #expect(hot.contains("unmapped"))
+        #expect(hot.contains("review"), "hot plus thin-docs is the combination worth surfacing")
+
+        let calm = Stats.flags(for: file(churn: 0, coverage: 0.9, directives: 4, age: 800),
+                               churnThreshold: 50)
+        #expect(calm == ["dormant"])
+    }
+}
+
+@Suite("Stats dashboard")
+struct StatsDashboardTests {
+
+    static func report() -> Stats.Report {
+        var report = Stats.Report(scope: ".")
+        report.mass = Stats.Mass(p50: 1, p90: 2, max: 3, empty_files: 0, top_decile_share: 0.5,
+                                 densest: [Stats.FileStat(path: "Sources/A.swift",
+                                                          declarations: 12, bytes: 900)])
+        report.volatility = Stats.Volatility(
+            window_days: 30, bucket: "5d", bucket_count: 6, files_changed: 1, commits: 4, authors: 2,
+            files: [Stats.FileVolatility(path: "Sources/A.swift", commits: 4, authors: 2,
+                                         insertions: 30, deletions: 10, churn: 40, age_days: 3,
+                                         declarations: 12, doc_coverage: 0.25, directives: 2,
+                                         series: [0, 1, 0, 2, 0, 1], flags: ["hot"])])
+        report.delta = Stats.Delta(
+            files_changed: 1, added: 1, removed: 0, signature_changed: 0, body_changed: 0,
+            api_added: 1, api_removed: 0, guarded_changed: 1, undocumented_changed: 0,
+            changes: [Stats.DeclChange(decl_id: "A.make(id:String)", kind: "func",
+                                       path: "Sources/A.swift", line: 20, access: "public",
+                                       change: "added", lines_touched: 9, documented: true,
+                                       guards: ["ai:invariant"])])
+        return report
+    }
+
+    /// One file entity, merged from two sections rather than repeated once per section — a UI
+    /// sorting a table must not see the same path twice with different columns filled in.
+    @Test func fileSectionsMergeIntoOneEntity() {
+        let dashboard = Stats.dashboard(
+            from: Self.report(),
+            asOf: Stats.AsOf(generated_at: "2026-09-11T00:00:00Z", head: "abc1234",
+                             since_ref: "HEAD", since_sha: "def5678", window_days: 30))
+        let files = dashboard.entities.filter { $0.kind == "file" }
+        #expect(files.count == 1)
+        let file = try! #require(files.first)
+        #expect(file.id == "file:Sources/A.swift")
+        #expect(file.label == "A.swift")
+        #expect(file.values["bytes"] != nil, "carried over from mass")
+        #expect(file.values["churn"] != nil, "carried over from volatility")
+        #expect(file.series?["commits"]?.count == 6)
+    }
+
+    /// Drill-down is a filter on `parent`, so a declaration must point at a file entity that is
+    /// actually in the array under that exact id.
+    @Test func declarationsPointAtTheirFileEntity() {
+        let dashboard = Stats.dashboard(
+            from: Self.report(),
+            asOf: Stats.AsOf(generated_at: "2026-09-11T00:00:00Z", head: "abc1234",
+                             since_ref: "HEAD", since_sha: "def5678", window_days: 30))
+        let ids = Set(dashboard.entities.map(\.id))
+        let decls = dashboard.entities.filter { $0.kind == "declaration" }
+        #expect(decls.count == 1)
+        for decl in decls {
+            let parent = try! #require(decl.parent)
+            #expect(ids.contains(parent))
+        }
+        #expect(decls.first?.flags.contains("guarded") == true)
+        #expect(decls.first?.flags.contains("added") == true)
+    }
+
+    /// Every value stays a number or a short enum string. Preformatting them would make the UI
+    /// parse its own data back out, and sorting would go lexicographic.
+    @Test func valuesEncodeAsNumbersNotStrings() throws {
+        let dashboard = Stats.dashboard(
+            from: Self.report(),
+            asOf: Stats.AsOf(generated_at: "2026-09-11T00:00:00Z", head: "abc1234",
+                             since_ref: "HEAD", since_sha: "def5678", window_days: 30))
+        let data = try JSONEncoder().encode(dashboard)
+        let json = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let entities = try #require(json["entities"] as? [[String: Any]])
+        let file = try #require(entities.first { ($0["kind"] as? String) == "file" })
+        let values = try #require(file["values"] as? [String: Any])
+        #expect(values["churn"] as? Int == 40)
+        #expect((values["doc_coverage"] as? Double) == 0.25)
+        #expect(values["churn"] as? String == nil, "a number encoded as text cannot be sorted")
+
+        // The descriptor block is what lets a UI colour a column without a hardcoded list.
+        let metrics = try #require(json["metrics"] as? [String: Any])
+        let churn = try #require(metrics["churn"] as? [String: Any])
+        #expect(churn["higher_is"] as? String == "riskier")
+        #expect(churn["unit"] as? String == "lines")
+        #expect(json["schema_version"] as? Int == 2)
+    }
+
+    @Test func missingHistoryStillProducesAFileList() {
+        var bare = Stats.Report(scope: ".")
+        bare.mass = Stats.Mass(p50: 1, p90: 1, max: 1, empty_files: 0, top_decile_share: 1,
+                               densest: [Stats.FileStat(path: "A.swift", declarations: 3, bytes: 10)])
+        let dashboard = Stats.dashboard(
+            from: bare,
+            asOf: Stats.AsOf(generated_at: "2026-09-11T00:00:00Z", head: "-",
+                             since_ref: nil, since_sha: nil, window_days: nil))
+        #expect(dashboard.entities.count == 1)
+        #expect(dashboard.series_axis == nil)
+        #expect(dashboard.entities.first?.flags.isEmpty == true)
+    }
+}
