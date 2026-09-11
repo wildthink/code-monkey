@@ -625,6 +625,41 @@ code-monkey query "SELECT name, file_path FROM declarations d
 
 SELECT/WITH/PRAGMA only. The schema is documented at the end of this guide.
 
+### `stats` — project shape, before the first read
+
+```bash
+code-monkey stats                            # every section
+code-monkey stats --section mass --top 20    # the files worth reading first
+code-monkey stats --section fold             # the case for reading at level 0
+code-monkey stats --section docs             # where the prose is missing
+code-monkey stats Sources/MyApp              # narrow to a subtree
+```
+
+A sizing pass. `doctor` says whether the index is usable and `query` answers one
+question at a time; `stats` answers the standing ones at once, off the index
+alone, without opening a source file.
+
+| Section | What it answers |
+|---|---|
+| `overview` | file, declaration and byte totals, production vs test |
+| `kinds` | declarations per kind, with the line span each occupies |
+| `mass` | declarations per file: p50/p90/max, concentration, densest files |
+| `fold` | body bytes against source bytes — what `code -L0` never emits |
+| `docs` | doc coverage by access, directive tags, files no section claims |
+| `coupling` | most-imported modules, most-conformed protocols |
+| `hotspots` | longest bodies, and undocumented names with the widest fan-in |
+
+`--section` is repeatable and narrows the work as well as the output: a section
+nobody asked for runs no query.
+
+Three figures carry caveats. `span` nests, so a struct's span covers its members
+and the column does not sum to a file total. Byte totals count top-level
+declarations only, for the same reason. And `hotspots` fan-in counts only call
+edges the receiver corroborates, which makes it a **lower** bound: a call reached
+through a closure parameter has no indexed receiver and is dropped rather than
+guessed. Matching on the callee name alone would be the other error, and it ranks
+`append` and `String` at the top of every project.
+
 ### `weave` — literate projection
 
 ```bash
@@ -1106,9 +1141,9 @@ that doesn't build yet — that's this.
 ## MCP server
 
 `code-monkey-mcp` (`Sources/code-monkey-mcp/`) exposes the CLI's commands as MCP
-tools over stdio — currently 15 (`code_monkey_init`, `_index`, `_doctor`, `_get`,
-`_code`, `_calls`, `_clip`, `_query`, `_weave`, `_imports`, `_file_read`,
-`_file_write`, `_file_append`, `_file_log`, `_version`). This lets an agent use
+tools over stdio — currently 18 (`code_monkey_init`, `_index`, `_doctor`, `_get`,
+`_code`, `_calls`, `_clip`, `_move`, `_rename`, `_query`, `_stats`, `_weave`,
+`_imports`, `_file_read`, `_file_write`, `_file_append`, `_file_log`, `_version`). This lets an agent use
 `code-monkey` as a standing connection instead of invoking the CLI through a
 shell each time.
 
@@ -1157,15 +1192,20 @@ shouldn't be quoted the write tools.
 
 | Profile | Tools | Use when |
 |---|---|---|
-| `all` *(default)* | 15 | open-ended sessions |
+| `all` *(default)* | 18 | open-ended sessions |
 | `read` | 6 — `get`, `code` | lookups only |
-| `nav` | 9 — `read` plus `calls`, `imports`, `query` | reading and tracing, no edits |
-| `write` | 11 — `read` plus `clip` and the four `file` tools | an agent that reads, then applies changes |
+| `nav` | 10 — `read` plus `calls`, `imports`, `query`, `stats` | reading and tracing, no edits |
+| `write` | 13 — `read` plus `clip`, `move`, `rename` and the four `file` tools | an agent that reads, then applies changes |
 
 `init`, `index`, `doctor` and `version` are in every profile: a client that
 can't build or diagnose its own index is stranded by the first stale-index
 error. `weave` is document generation rather than lookup, so it appears only
 in `all`.
+
+`write` builds on `read`, not on the essential four: an edit is a read followed
+by a write, and a client that can `clip` a declaration but cannot `get` the one
+it is replacing has to guess — or open the whole file, which is the cost this
+tool exists to avoid.
 
 ```
 code-monkey-mcp --profile nav
@@ -1225,6 +1265,7 @@ get         field-selectable read; bare positional resolves one record,
             --limit/--offset            (enumerate mode)
 clip        write-only: --paste-replacing <decl_id/name> (--file to disambiguate)
 query       read-only SELECT/WITH/PRAGMA
+stats       project shape (--section, --top, <path>)
 weave       Markdown literate projection (--summary, --section, --access, --spi)
 imports     import lines + their @_spi groups (--module, --spi, --testable)
 file        sandbox-escape read/write/append/log

@@ -607,6 +607,7 @@ rename      rename a decl: --to <identifier>; refs reported, not rewritten
 query       read-only SQL
 weave       Markdown literate projection
 imports     import lines with their @_spi groups and @testable marks
+stats       project shape: mass, reading cost, doc coverage, hotspots
             --module <name> --spi any|none|<group> --testable
 file        sandbox-escape read/write/append/log
 version     build info

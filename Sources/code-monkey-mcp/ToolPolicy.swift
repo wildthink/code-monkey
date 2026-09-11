@@ -70,6 +70,7 @@ struct ToolPolicy: Sendable {
         "code_monkey_calls": ["--json"],
         "code_monkey_query": ["--json"],
         "code_monkey_imports": ["--json"],
+        "code_monkey_stats": ["--json"],
     ]
 
     /// Payload delivered on standard input rather than as an argument, because it is a file's
@@ -133,6 +134,7 @@ struct ToolPolicy: Sendable {
         static let read: Set<String> = essential.union(["code_monkey_get", "code_monkey_code"])
         static let nav: Set<String> = read.union([
             "code_monkey_calls", "code_monkey_imports", "code_monkey_query",
+            "code_monkey_stats",
         ])
         /// Builds on `read`, not on `essential`: an edit is a read followed by a write, and a
         /// client that can `clip` a declaration but cannot `get` one first has to guess at what

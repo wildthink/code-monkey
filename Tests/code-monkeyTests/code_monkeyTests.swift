@@ -2050,3 +2050,206 @@ struct DoctorTests {
         }
     }
 }
+
+@Suite("Stats")
+struct StatsTests {
+
+    // MARK: pure aggregation
+
+    @Test func percentileIsNearestRank() {
+        let sorted = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        #expect(Stats.percentile(sorted, 0.5) == 5)
+        #expect(Stats.percentile(sorted, 0.9) == 9)
+        #expect(Stats.percentile(sorted, 1.0) == 10)
+        // Every reported value is a member of the input, never an interpolation between two.
+        #expect(Stats.percentile([4, 9], 0.5) == 4)
+        #expect(Stats.percentile([], 0.5) == 0)
+    }
+
+    @Test func concentrationMeasuresTheTopSlice() {
+        // Nine ones and a ninety: the densest tenth holds ninety percent of the mass.
+        let skewed = [90] + Array(repeating: 1, count: 9)
+        #expect(abs(Stats.concentration(skewed, topFraction: 0.1) - 0.909) < 0.001)
+        // Perfectly flat: the top tenth holds exactly its share.
+        let flat = Array(repeating: 5, count: 10)
+        #expect(abs(Stats.concentration(flat, topFraction: 0.1) - 0.1) < 0.001)
+        #expect(Stats.concentration([], topFraction: 0.1) == 0)
+    }
+
+    // MARK: over a real index
+
+    /// Two files, one of them under `Tests`, so the production/test split has something to
+    /// separate and the path filter has something to exclude.
+    private func makeProject() throws -> URL {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("cm-stats-\(UUID().uuidString)")
+        let sources = tmp.appendingPathComponent("Sources")
+        let tests = tmp.appendingPathComponent("Tests")
+        try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: tests, withIntermediateDirectories: true)
+        try """
+        import Foundation
+
+        //# ai:section: "Core"
+        /// Documented.
+        public struct Store {
+            public var items: [String] = []
+
+            /// Documented too.
+            public func documented() -> Int { items.count }
+
+            func undocumented() -> Int {
+                return documented() + 1
+            }
+        }
+        """.write(to: sources.appendingPathComponent("Store.swift"), atomically: true, encoding: .utf8)
+        try """
+        struct Helper {
+            func call() -> Int { 0 }
+        }
+        """.write(to: tests.appendingPathComponent("HelperTests.swift"), atomically: true, encoding: .utf8)
+        try Config.defaultTOML.write(to: tmp.appendingPathComponent(".code-monkey.toml"),
+                                     atomically: true, encoding: .utf8)
+        return tmp
+    }
+
+    private func indexed(_ root: URL) async throws -> (Project, Database) {
+        let project = try Project.load(explicitRoot: root.path)
+        let db = try Database(path: project.dbPath, mode: .readWrite)
+        try await Schema.bootstrap(db)
+        _ = try await Indexer(project: project, db: db).run(full: true)
+        return (project, db)
+    }
+
+    @Test func overviewSplitsProductionFromTest() async throws {
+        let root = try makeProject()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (project, db) = try await indexed(root)
+        let report = try await Stats.report(
+            db: db, root: project.root, path: nil, sections: [.overview], top: 10)
+        let overview = try #require(report.overview)
+        #expect(overview.files == 2)
+        #expect(overview.production_files == 1)
+        #expect(overview.test_files == 1)
+        #expect(overview.declarations > 0)
+    }
+
+    /// The byte total must not grow when a type gains members. Summing `decl_length` over every
+    /// row instead of the top-level ones is the mistake this guards.
+    @Test func byteTotalsCountTopLevelDeclarationsOnce() async throws {
+        let root = try makeProject()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (project, db) = try await indexed(root)
+        let report = try await Stats.report(
+            db: db, root: project.root, path: nil, sections: [.overview], top: 10)
+        let overview = try #require(report.overview)
+
+        let onDisk = try [root.appendingPathComponent("Sources/Store.swift"),
+                          root.appendingPathComponent("Tests/HelperTests.swift")]
+            .reduce(0) { $0 + (try Data(contentsOf: $1).count) }
+        #expect(overview.source_bytes <= onDisk,
+                "top-level spans cannot exceed the files that contain them")
+        #expect(overview.source_bytes > onDisk / 2)
+    }
+
+    /// Bodies are a strict share of source, which holds only because no indexed body nests
+    /// inside another. A future extractor that records a body for a type would break this.
+    @Test func bodyBytesDoNotOverlap() async throws {
+        let root = try makeProject()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (project, db) = try await indexed(root)
+        let report = try await Stats.report(
+            db: db, root: project.root, path: nil, sections: [.fold], top: 10)
+        let fold = try #require(report.fold)
+        #expect(fold.body_bytes > 0)
+        #expect(fold.body_bytes < fold.source_bytes)
+        #expect(fold.body_share > 0 && fold.body_share < 1)
+        #expect(fold.doc_bytes > 0)
+
+        let nested = try await db.query("""
+            SELECT COUNT(*) AS n FROM declarations
+             WHERE body_length IS NOT NULL AND container_kind = 'func'
+            """)
+        #expect(nested.first?.int64("n") == 0,
+                "a body inside a body would make body_bytes double-count")
+    }
+
+    /// Swift spells `internal` by writing nothing, so the raw column is empty for most rows.
+    /// A coverage report that passes that through has a blank bucket and a silent hole.
+    @Test func accessIsNormalizedBeforeCoverageIsComputed() async throws {
+        let root = try makeProject()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (project, db) = try await indexed(root)
+        let report = try await Stats.report(
+            db: db, root: project.root, path: nil, sections: [.docs], top: 10)
+        let docs = try #require(report.docs)
+        #expect(!docs.by_access.isEmpty)
+        #expect(docs.by_access.allSatisfy { !$0.access.isEmpty })
+        #expect(docs.by_access.contains { $0.access == "internal" })
+        #expect(docs.by_access.contains { $0.access == "public" })
+        for bucket in docs.by_access {
+            #expect(bucket.documented <= bucket.declarations)
+            #expect(bucket.coverage >= 0 && bucket.coverage <= 1)
+        }
+        // One file declares a section; the other declares nothing.
+        #expect(docs.files_without_section == 1)
+    }
+
+    @Test func pathFilterNarrowsEveryCount() async throws {
+        let root = try makeProject()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (project, db) = try await indexed(root)
+        let whole = try await Stats.report(
+            db: db, root: project.root, path: nil, sections: [.overview], top: 10)
+        let scoped = try await Stats.report(
+            db: db, root: project.root, path: "Sources", sections: [.overview], top: 10)
+        #expect(scoped.overview?.files == 1)
+        #expect(scoped.overview?.test_files == 0)
+        #expect(scoped.overview!.declarations < whole.overview!.declarations)
+        #expect(scoped.scope == "Sources")
+    }
+
+    /// Fan-in must name a declaration, not a bare identifier. `undocumented()` is called once
+    /// from a sibling method with no receiver, which is exactly the corroborated case.
+    @Test func fanInCountsOnlyCorroboratedEdges() async throws {
+        let root = try makeProject()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (project, db) = try await indexed(root)
+        let report = try await Stats.report(
+            db: db, root: project.root, path: nil, sections: [.hotspots], top: 10)
+        let hotspots = try #require(report.hotspots)
+        #expect(hotspots.undocumented_fan_in.allSatisfy { $0.callers > 0 })
+        // `documented()` carries a doc comment, so it is excluded however often it is called.
+        #expect(!hotspots.undocumented_fan_in.contains { $0.decl_id.contains("documented(") })
+        #expect(!hotspots.longest_bodies.isEmpty)
+        #expect(hotspots.longest_bodies.allSatisfy { $0.span > 0 && !$0.path.isEmpty })
+    }
+
+    /// Registration is two edits in two files, and forgetting the second one ships a tool the
+    /// navigation profile never advertises and that returns text where a client expects JSON.
+    @Test func statsIsAdvertisedToNavigatingClientsAsJSON() throws {
+        let bridge = ToolBridge(root: try CommandModel(CodeMonkey.self).root, policy: ToolPolicy())
+        let names = Set(bridge.tools().map(\.name))
+        #expect(names.contains("code_monkey_stats"))
+        #expect(ToolPolicy.Profile.nav.contains("code_monkey_stats"))
+        #expect(!ToolPolicy.Profile.read.contains("code_monkey_stats"))
+        #expect(bridge.policy.injectedArguments["code_monkey_stats"] == ["--json"])
+    }
+
+    @Test func sectionsAreIndependent() async throws {
+        let root = try makeProject()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (project, db) = try await indexed(root)
+        let only = try await Stats.report(
+            db: db, root: project.root, path: nil, sections: [.kinds], top: 10)
+        #expect(only.kinds != nil)
+        #expect(only.overview == nil)
+        #expect(only.mass == nil)
+        #expect(only.fold == nil)
+        #expect(only.docs == nil)
+        #expect(only.coupling == nil)
+        #expect(only.hotspots == nil)
+        #expect(Stats.render(only).contains("## kinds"))
+        #expect(!Stats.render(only).contains("## overview"))
+    }
+}

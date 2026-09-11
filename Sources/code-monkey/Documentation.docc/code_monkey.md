@@ -43,7 +43,7 @@ Fifteen subcommands, in four groups.
 | Group | Commands |
 |---|---|
 | Bootstrap and diagnose | `init`, `index`, `doctor`, `version` |
-| Read | `get`, `code`, `calls`, `imports`, `query` |
+| Read | `get`, `code`, `calls`, `imports`, `query`, `stats` |
 | Write | `clip`, `move`, `rename` |
 | Project out | `weave`, `file`, `repl` |
 

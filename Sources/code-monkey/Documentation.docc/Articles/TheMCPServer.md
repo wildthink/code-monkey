@@ -6,7 +6,7 @@ standard input and output.
 ## Overview
 
 Seventeen tools ship today, covering `init`, `index`, `doctor`, `get`, `code`,
-`calls`, `clip`, `move`, `rename`, `query`, `weave`, `imports`, `version`, and the
+`calls`, `clip`, `move`, `rename`, `query`, `stats`, `weave`, `imports`, `version`, and the
 four `file` operations. This lets an agent use code-monkey as a standing
 connection instead of invoking the CLI through a shell each time.
 

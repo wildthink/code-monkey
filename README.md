@@ -64,6 +64,7 @@ code-monkey get       # everything, cheapest possible read
 | `calls` | call tree: who reaches a decl, or what it reaches |
 | `imports` | import lines with `@_spi` groups and `@testable` marks |
 | `query` | read-only SQL against the index |
+| `stats` | project shape: mass, reading cost, doc coverage, hotspots |
 | `weave` | Markdown literate projection |
 | `clip` | write one declaration: replace, insert before/after, or cut |
 | `move` | relocate a declaration, with its comment block, to another file |
