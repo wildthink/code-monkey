@@ -305,6 +305,135 @@ command.
 
 ---
 
+## 6. Directives as contracts — the surface around `//# ai:`
+
+Written 2026-09-11, after reading [code-contracts](https://github.com/spolu/code-contracts)
+(`code-contracts.cc`) and asking what of it this project should take.
+
+**The overlap is near-total on the core and empty everywhere else.** Their
+`@cc` directive in a doc comment *is* `//# ai:invariant` — prose concrete
+enough to find a violation, colocated with what it governs, discoverable by a
+grep. This repo already carries 75 invariants, 34 warns and 2 specs, so the
+idea needs no adoption. What they have and this doesn't is everything *around*
+the directive: an identity, a scope wider than one declaration, a lookup keyed
+by source location, and a linter.
+
+Four tiers, cheapest first. They are independent — 6a is worth doing whether or
+not the rest ever lands — but 6b is the one that composes with what already
+shipped, and 6c is the one an agent would actually call.
+
+### 6a. `lint` — a tag that doesn't exist should not index silently
+
+**This is a defect, not an enhancement.** `parseDirective`
+(`Extractor.swift:738`) takes everything after `ai:` up to the first
+non-identifier character and stores it as the tag. Nothing anywhere validates
+it. `DirectiveClass` (`Get.swift:96`) then partitions directives into `summary`
+and `invariants` by two hardcoded sets — so `//# ai:invarinat: ...` parses
+cleanly, lands in the `directives` table, matches neither set, and **vanishes
+from `get` output with no warning at any layer**. The failure mode is the worst
+kind this tool can have: a constraint the author believed they wrote, which no
+reader will ever be shown.
+
+Their `cc-check format` exists for exactly this, and reports duplicate ids
+besides.
+
+**LOE: 3–4 hours.** A tag whitelist derived from `DirectiveClass` (make it the
+single source rather than a second copy), a pass over the `directives` table,
+and a command that exits non-zero. No parsing work — the rows are already
+indexed, so this is a query and a renderer.
+
+**Worth noting while in there.** `DirectiveClass` declares ten tags; six appear
+in this repo. `ai:requires`, `ai:example`, `ai:depends` and `ai:prompt` have
+zero rows and may never have been used. A linter that rejects unknown tags
+forces that vocabulary to be decided rather than accumulated.
+
+### 6b. Stable ids on directives
+
+**What.** An optional id in the directive: `//# ai:invariant(no-global-store):
+...`. Unique within the declaration it attaches to, reusable across
+declarations — their scoping rule, which is the right one.
+
+**Why it earns its keep, and it is not documentation.** Every directive today
+is keyed by declaration, tag, value and line. None of those survive an edit, so
+nothing can refer to a specific invariant across two versions of the tree. An
+id buys three things that already have homes here:
+
+- `stats --section delta` can say *"invariant `no-global-store` was removed"*.
+  It currently classifies declarations; this is the same join one column over,
+  and removal of an invariant is a far louder signal than modification of a
+  body.
+- A review comment, a commit message or a test can cite one.
+- The `--argv` log and the audit trail become greppable by constraint rather
+  than by file.
+
+**LOE: 1 day.** ~15 LOC in the parser, a nullable column, the `delta`
+crossing, and tests. It is a schema bump, so it inherits the migration problem
+noted at the end of this file — price it as one, not as a parser change.
+
+**The trap.** Ids are a naming surface, and naming surfaces attract
+bureaucracy. Keep them optional forever. The moment `lint` requires one on
+every invariant, 75 existing directives need names nobody wants to invent, and
+the tool starts refusing to index a repo over a matter of taste.
+
+### 6c. Rules applicable at a source location
+
+**What.** `cc-check list path/to/file.ts:42` returns every contract governing
+that line, walking up through ancestor scopes. There is no equivalent here:
+`get` is keyed by `decl_id`, which is the wrong key for the question *"what am
+I not allowed to break in the code I am about to edit?"*
+
+**Why this is the one an agent calls.** It is the read that belongs immediately
+before the write primitive, and it is the only tier here that changes agent
+behaviour rather than author behaviour. `SKILL.md` can say "check the
+invariants first" as many times as it likes; a location-keyed lookup makes it
+one call instead of a judgement.
+
+**LOE: 4–6 hours** on its own, near zero as a flag. The query is `file_id`,
+`line BETWEEN start_line AND end_line`, then the `container` chain upward —
+all indexed. Do **not** ship it as a new MCP tool: item 1 settled that a tool
+costs its whole description on every request, and this is a cut of `get`. It is
+`get --at Sources/x.swift:42`, or a `query --recipe`.
+
+### 6d. Directory-scoped rules
+
+**What.** Their `CONTRACTS` file holds unattached contracts covering a
+directory and everything beneath it — architectural boundaries, dependency
+constraints, security practice. Rules with no host declaration currently have
+nowhere to live here. `ai:section` labels a region; it does not carry anything
+downward.
+
+**Why it is last despite being the most interesting.** The `narrative` table
+already exists with a `sidecar` kind (`Index.swift:659`) and is **empty in this
+repo** — the mechanism shipped and nobody fed it. Adding a second unattached-
+prose mechanism before understanding why the first went unused is how a tool
+grows two half-used surfaces instead of one working one. Feed `sidecar` first,
+or delete it.
+
+**LOE: 1–1.5 days** if built, most of it inheritance semantics and the
+`--no-global` equivalent, not parsing.
+
+### What of theirs is explicitly not worth taking
+
+- **`owner` / `notify` GitHub handles in source.** `stats --section volatility`
+  already derives authors from git, which cannot go stale. Handles written into
+  comments rot silently the first time someone leaves, and they only pay off if
+  something is sending notifications — which is the next bullet.
+- **The PR review bot.** A hosted service that reads diffs and posts comments.
+  It would give up the no-subprocess, no-network property priced in item 1, and
+  it is a different product. The *useful half* survives without it: `delta`
+  already classifies changed declarations, so crossing that with the invariants
+  guarding them — "you touched 3 declarations carrying 5 invariants, here they
+  are" — is mostly built and runs locally.
+- **Adopting `@cc` as a second directive syntax.** Their format is
+  language-agnostic and lives in doc comments; `//# ai:` is a line-comment
+  sigil parsed by a Swift extractor. Teaching the extractor to also recognise
+  `@cc` and map it onto `directives` with a `ai:contract` tag is maybe 2 hours,
+  but nobody has asked, and two spellings of one concept is a documentation
+  cost paid on every read forever. Revisit only if this index ever needs to be
+  consumed by their toolchain, or a second language lands.
+
+---
+
 ## Smaller things noticed in passing
 
 - **`--argv` does not emit `--project`.** A recorded line replays against
@@ -359,6 +488,12 @@ command.
   quick succession (call sites → bindings → conformances, and a concurrent SPI
   change). `doctor` surfaces the mismatch and `index` can reset, which is the
   right trade for a derived artifact — but the churn rate is worth watching.
+
+- **The `query` tool description omits `ai:see`.** It names five directive tags
+  as the authoritative set; the table carries six, and `DirectiveClass` knows
+  ten. The description is what an agent reads before writing SQL, so the
+  omission costs a real query. One line, and it stops mattering the moment 6a
+  derives the list from one place.
 
 
 ---
