@@ -22,7 +22,9 @@ struct ToolPolicy: Sendable {
 
     /// `--json` is the server's business, not the client's — every tool that emits structured
     /// output gets it injected below, and offering it as a parameter only invites turning it off.
-    private let alwaysHidden: Set<String> = ["json"]
+    /// `--color` likewise: the bridge reads through a pipe, so `auto` already stays plain, and
+    /// `always` would only spend an agent's context on escape codes.
+    private let alwaysHidden: Set<String> = ["json", "color"]
 
     /// Integers. The tool info schema carries no value types at all, so this is the one gap that
     /// cannot be closed by reading harder.

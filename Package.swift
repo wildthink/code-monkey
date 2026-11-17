@@ -24,6 +24,7 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "SwiftSyntax", package: "swift-syntax"),
                 .product(name: "SwiftParser", package: "swift-syntax"),
+                .product(name: "SwiftIDEUtils", package: "swift-syntax"),
                 .product(name: "TOMLKit", package: "TOMLKit"),
                 .product(name: "CommandREPL", package: "LineEditor"),
             ]

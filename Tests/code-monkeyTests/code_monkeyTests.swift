@@ -2592,3 +2592,54 @@ struct StatsDashboardTests {
         #expect(dashboard.entities.first?.flags.isEmpty == true)
     }
 }
+
+@Suite("Highlight")
+struct HighlightTests {
+    @Test func autoPaintsOnlyAtATerminal() {
+        #expect(ColorMode.auto.enabled(isTTY: true, environment: [:]))
+        #expect(!ColorMode.auto.enabled(isTTY: false, environment: [:]))
+        #expect(!ColorMode.auto.enabled(isTTY: true, environment: ["NO_COLOR": "1"]))
+        #expect(ColorMode.auto.enabled(isTTY: true, environment: ["NO_COLOR": ""]))
+        #expect(!ColorMode.auto.enabled(isTTY: true, environment: ["TERM": "dumb"]))
+        #expect(ColorMode.always.enabled(isTTY: false, environment: ["NO_COLOR": "1"]))
+        #expect(!ColorMode.never.enabled(isTTY: true, environment: [:]))
+    }
+
+    @Test func stylesTheOutlinesTokens() {
+        let out = Highlighter.colorize("""
+            // ── Sources/A.swift
+            /// Docs.
+            //# ai:invariant: holds
+            @MainActor struct A {
+                var n: Int = 1
+                func f() -> String { ... }  // 4-9
+            }
+            """)
+        #expect(out.contains("\u{1B}[1;2m// ── Sources/A.swift\u{1B}[0m"))
+        #expect(out.contains("\u{1B}[32m/// Docs.\u{1B}[0m"))
+        #expect(out.contains("\u{1B}[1;33m//# ai:invariant: holds\u{1B}[0m"))
+        #expect(out.contains("\u{1B}[35mstruct\u{1B}[0m"))
+        #expect(out.contains("\u{1B}[36mInt\u{1B}[0m"))
+        #expect(out.contains("\u{1B}[36mString\u{1B}[0m"))
+        #expect(out.contains("\u{1B}[33m1\u{1B}[0m"))
+        #expect(out.contains("\u{1B}[2;32m// 4-9\u{1B}[0m"))
+    }
+
+    @Test func strippingEscapesGivesBackTheInput() throws {
+        let input = "struct S {\n    func g(x: Int) -> [String: Int] {}\n}\n\n// +3 more — raise --limit"
+        let painted = Highlighter.colorize(input)
+        let plain = painted.replacing(try Regex("\u{1B}\\[[0-9;]*m"), with: "")
+        #expect(plain == input)
+        // No style is ever left open across a line break.
+        let escape = try Regex("\u{1B}\\[[0-9;]*m")
+        for line in painted.split(separator: "\n") {
+            let codes = line.matches(of: escape).count
+            let resets = line.ranges(of: "\u{1B}[0m").count
+            #expect(codes == 2 * resets)
+        }
+    }
+
+    @Test func colorIsNotOfferedOverMCP() {
+        #expect(ToolPolicy().hiddenArguments(for: "code_monkey_code").contains("color"))
+    }
+}

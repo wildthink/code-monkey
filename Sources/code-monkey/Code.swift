@@ -223,6 +223,8 @@ struct CodeCmd: AsyncParsableCommand {
     @Flag(name: .long, help: "Annotate each decl with its line range.") var numbers: Bool = false
     @Flag(name: .long, help: "Omit the `// path` provenance comments.") var noHeader: Bool = false
     @Option(name: .long, help: "Cap the number of top-level decls rendered.") var limit: Int = 200
+    @Option(name: .long, help: "Syntax coloring: auto (only at a terminal, honoring NO_COLOR) | always | never.")
+    var color: ColorMode = .auto
 
     // MARK: run
 
@@ -354,7 +356,8 @@ struct CodeCmd: AsyncParsableCommand {
             }
         }
         if truncated { out.append("\n// +\(matched - limit) more — raise --limit or narrow the selector") }
-        print(out.joined(separator: "\n"))
+        let text = out.joined(separator: "\n")
+        print(color.enabled() ? Highlighter.colorize(text) : text)
     }
 
     /// Moves test decls to the end, preserving the order within each group, and returns how
