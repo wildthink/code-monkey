@@ -57,9 +57,13 @@ enum Skill {
     }
 
     /// The version a stamped copy names, if it carries one.
-    static func stampedVersion(_ text: String) -> String? {
-        text.components(separatedBy: "\n").first { $0.hasPrefix(versionKey) }
-            .map { String($0.dropFirst(versionKey.count)).trimmingCharacters(in: CharacterSet(charactersIn: "\" ")) }
+    static func stampedVersion(_ text: String) -> String? { stampValue(versionKey, in: text) }
+
+    static func stampedDigest(_ text: String) -> String? { stampValue(digestKey, in: text) }
+
+    private static func stampValue(_ key: String, in text: String) -> String? {
+        text.components(separatedBy: "\n").first { $0.hasPrefix(key) }
+            .map { String($0.dropFirst(key.count)).trimmingCharacters(in: CharacterSet(charactersIn: "\" ")) }
     }
 
     /// The `name:` from a file's frontmatter, to tell this skill from someone else's.
@@ -129,9 +133,25 @@ enum Skill {
         return out
     }
 
+    /// The body must match exactly. The frontmatter may differ only when the copy's stamp names
+    /// this binary's digest: claude.ai re-serializes the YAML on upload — a folded
+    /// `description: >` comes back as one quoted line — so a byte comparison would report every
+    /// uploaded skill stale. The stamp is what vouches for a frontmatter the host rewrote; an
+    /// unstamped copy with different frontmatter cannot be vouched for and reads as stale.
+    //# ai:invariant: a body that differs is always stale, whatever the stamp claims
     static func status(of text: String) -> Status {
         func norm(_ s: String) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }
-        return norm(unstamped(text)) == norm(markdown) ? .current : .stale
+        let copy = unstamped(text)
+        guard norm(body(copy)) == norm(body(markdown)) else { return .stale }
+        if norm(copy) == norm(markdown) { return .current }
+        return stampedDigest(text) == digest(markdown) ? .current : .stale
+    }
+
+    /// Everything after the frontmatter's closing `---`, or the whole text if it has none.
+    static func body(_ text: String) -> String {
+        let lines = text.components(separatedBy: "\n")
+        guard lines.first == "---", let close = lines.dropFirst().firstIndex(of: "---") else { return text }
+        return lines[(close + 1)...].joined(separator: "\n")
     }
 
     /// Every known location holding a copy of *this* skill, with its status.

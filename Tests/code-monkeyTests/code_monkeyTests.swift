@@ -2790,6 +2790,27 @@ struct SkillTests {
         #expect(Skill.status(of: Skill.stamped(Skill.markdown + "\nan old line", version: BuildInfo.version)) == .stale)
     }
 
+    /// claude.ai re-serializes frontmatter on upload: the folded `description: >` block comes back
+    /// as one quoted line. The stamp vouches for that; without it, or with a changed body, it
+    /// cannot be told from a real difference.
+    @Test func aHostRewritingTheFrontmatterIsNotStaleness() {
+        let stamped = Skill.stamped()
+        var lines = stamped.components(separatedBy: "\n")
+        let start = lines.firstIndex { $0.hasPrefix("description:") }!
+        let end = lines[(start + 1)...].firstIndex { !$0.hasPrefix("  ") }!
+        let folded = lines[(start + 1)..<end].map { $0.trimmingCharacters(in: .whitespaces) }
+            .joined(separator: " ")
+        lines.replaceSubrange(start..<end, with: ["description: \"\(folded)\\n\""])
+        let rewritten = lines.joined(separator: "\n")
+
+        #expect(rewritten != stamped)
+        #expect(Skill.status(of: rewritten) == .current)
+        // The same rewrite without a stamp has nothing vouching for it.
+        #expect(Skill.status(of: Skill.unstamped(rewritten)) == .stale)
+        // And a stamp never vouches for a body that changed.
+        #expect(Skill.status(of: rewritten + "\nan extra line") == .stale)
+    }
+
     @Test func installedCopiesAreFoundAndJudged() throws {
         let home = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("cm-skill-\(UUID())")
         let project = home.appendingPathComponent("proj")
