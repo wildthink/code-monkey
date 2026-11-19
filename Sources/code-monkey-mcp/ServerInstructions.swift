@@ -27,9 +27,9 @@ enum ServerInstructions {
         Step(tool: "code_monkey_doctor", arguments: [],
              text: "index freshness, project root, which binary is running. Call "
                 + "code_monkey_index only when it reports stale files."),
-        Step(tool: "code_monkey_query", arguments: ["sql"],
-             text: "SELECT DISTINCT value FROM directives WHERE tag='ai:section' — the author's "
-                + "own architecture map. tag='ai:invariant' lists constraints that must hold."),
+        Step(tool: "code_monkey_query", arguments: ["recipe"],
+             text: "recipe \"sections\" — the author's own architecture map. Recipe "
+                + "\"invariants\" lists the constraints that must hold, before you edit."),
         Step(tool: "code_monkey_stats", arguments: ["section"],
              text: "section [\"mass\"] — which files hold the declarations. Ask for sections; "
                 + "the full report is several KB."),

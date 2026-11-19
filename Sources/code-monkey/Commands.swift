@@ -118,6 +118,8 @@ struct DoctorReport: Codable, Sendable {
     let running_build: BuildIdentity
     let checkout_build: BuildIdentity?
     let mcp_build: BuildIdentity?
+    /// Installed copies of the agent skill, checked against the text this binary carries.
+    var skills: [Skill.Installed] = []
     let warnings: [String]
 }
 
@@ -268,6 +270,17 @@ struct DoctorCmd: AsyncParsableCommand {
             warnings.append("no code-monkey-mcp beside the installed CLI; MCP clients have nothing to run")
         }
 
+        // A skill that disagrees with the binary teaches commands and flags the binary may not
+        // have. Compared by content, not by stamp, so a copy someone pasted by hand is checked too.
+        let skills = Skill.installed(project: project.root)
+        for (location, copy) in skills where copy.status == .stale {
+            warnings.append(
+                "\(location.kind) skill at \(copy.path) "
+                    + "(\(copy.stamped_version.map { "stamped \($0)" } ?? "unstamped")) differs from "
+                    + "the one this binary carries (\(BuildInfo.version)); \(location.remedy)"
+            )
+        }
+
         let indexExists = FileManager.default.fileExists(atPath: project.dbPath.path)
         var schemaVersion: Int?
         var journalMode: String?
@@ -308,6 +321,7 @@ struct DoctorCmd: AsyncParsableCommand {
             running_build: runningBuild,
             checkout_build: checkoutBuild,
             mcp_build: mcpBuild,
+            skills: skills.map(\.1),
             warnings: warnings
         )
         Printer.emit(
@@ -335,6 +349,10 @@ struct DoctorCmd: AsyncParsableCommand {
                     + "journal=\(report.journal_mode ?? "-") call_sites=\(report.call_sites ?? "-")"
             )
             lines.append("audit=\(report.audit_path)")
+            for copy in report.skills {
+                lines.append("skill=\(copy.path) \(copy.kind) \(copy.status.rawValue)"
+                             + (copy.stamped_version.map { " stamped=\($0)" } ?? ""))
+            }
             lines.append(warnings.isEmpty ? "status=ok" : "warnings=\(warnings.joined(separator: " | "))")
             return lines.joined(separator: "\n")
         }

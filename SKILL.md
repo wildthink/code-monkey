@@ -82,12 +82,12 @@ none is injected.
 `query` and `stats` decide *what* to read; `code` reads it. They are not
 substitutes. Cheapest useful order (sizes measured on this repo):
 
-1. `doctor` — provenance, index freshness, project root. ~300 B.
-2. `query "SELECT DISTINCT value FROM directives WHERE tag='ai:section'"` — the
-   author's own architecture map, ~15 rows, ~150 B. Also `WHERE
-   tag='ai:invariant'` for the constraints that must not be broken. No other
-   command lists sections: `code` cannot group by them, and `stats --section
-   docs` only counts them.
+1. `doctor` — provenance, index freshness, project root, and whether an
+   installed copy of this skill has fallen behind the binary. ~300 B.
+2. `query --recipe sections` — the author's own architecture map, ~15 rows,
+   ~150 B. `--recipe invariants` lists the constraints that must not be broken.
+   No other command lists sections: `code` cannot group by them, and `stats
+   --section docs` only counts them. `query --help` lists every recipe.
 3. `stats --section mass` — which files hold the declarations, ~600 B. Add
    `--section hotspots` for long bodies and undocumented high-fan-in names.
    Full `stats` is ~4.5 KB; ask for sections.
@@ -587,6 +587,27 @@ else `~/.code-monkey/audit.log`. GUIDE.md has the format details.
 
 ---
 
+## Installing this skill
+
+The binary carries this file as it stood when it was built, and `skill` hands
+it out with the version and a digest stamped into the frontmatter `metadata`:
+
+```bash
+code-monkey skill --write ~/.claude/skills     # Claude Code, every project
+code-monkey skill --write .claude/skills       # Claude Code, this project
+code-monkey skill --zip code-monkey.zip        # upload to claude.ai as an account skill
+code-monkey skill > SKILL.md                   # anywhere else
+```
+
+`doctor` compares every copy it can find — those two Claude Code locations and
+the desktop app's synced account skills — against the embedded text, by
+content rather than stamp, and warns with the command that fixes a stale one.
+An account skill is synced down from claude.ai and overwritten locally, so its
+fix is a fresh upload, never an edit in place. The MCP server is unaffected: it
+sends its own short form as `instructions`.
+
+---
+
 ## Failure modes you'll hit
 
 - **`project_root` is wrong, or `index_exists: false` despite a real index** —
@@ -657,6 +678,7 @@ imports     import lines with their @_spi groups and @testable marks
 stats       project shape: mass, reading cost, docs, hotspots, delta, volatility
             --section <name> (repeatable) --top N --since <ref> --window <days>
 file        sandbox-escape read/write/append/log
+skill       this skill, stamped: print | --write <skills dir> | --zip <file>
 version     build info
 ```
 

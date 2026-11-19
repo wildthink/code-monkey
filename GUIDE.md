@@ -964,6 +964,39 @@ diagnostic should not depend on the binary it is diagnosing being runnable.
 
 `doctor` identifies the binary actually running. It does not scan `PATH`.
 
+It also checks installed copies of the agent skill. The binary carries SKILL.md
+as it stood at build time (see `skill` below), and `doctor` compares each copy it
+finds — `~/.claude/skills/code-monkey`, the project's `.claude/skills/code-monkey`,
+and the Claude desktop app's synced account skills — against that text, by
+content rather than by stamp, so a copy pasted in by hand is judged too. Each
+stale copy is a warning naming the command that fixes it:
+
+```
+skill=/Users/me/.claude/skills/code-monkey/SKILL.md claude-code-user stale stamped=1.1.4
+```
+
+---
+
+## `skill`
+
+```bash
+code-monkey skill                              # print the stamped skill
+code-monkey skill --write ~/.claude/skills     # install for Claude Code
+code-monkey skill --zip code-monkey.zip        # bundle for a claude.ai account skill
+```
+
+Hands out the SKILL.md compiled into this binary, with `code-monkey-version` and
+`code-monkey-digest` added to its frontmatter `metadata`. `--write` creates
+`<dir>/code-monkey/SKILL.md` and refuses to replace a file that is some other
+skill. An account skill is synced down from claude.ai and overwritten locally,
+so it is updated by uploading the `--zip` bundle, never edited in place.
+
+The embedded copy is `Sources/code-monkey/SkillText.swift`, generated from
+SKILL.md by `make` and checked in so a plain `swift build` still works. A test
+fails when the two disagree — run `make skilltext` after editing SKILL.md. The
+command is not an MCP tool: the server sends its own short form of these rules as
+`instructions`, and a schema for an install step would cost every turn.
+
 ---
 
 ## Concurrency model
@@ -1288,7 +1321,8 @@ no profile.
 init        bootstrap project (.code-monkey.toml + dir)
 index       full or incremental build (--full to rebuild, --check for stale report, no writes)
             --no-call-sites to skip the call graph (~4x smaller index)
-doctor      executable/index/schema/WAL/call-sites/audit/freshness diagnostics
+doctor      executable/index/schema/WAL/call-sites/audit/freshness diagnostics,
+            and installed skills that have fallen behind the binary
 
 calls       syntactic call tree (--callees, --both, --depth, --min low|medium|high,
             --include-refs, --limit); edges are graded guesses, not facts
@@ -1300,6 +1334,7 @@ code        readable Swift outlines at a chosen level of disclosure
             --expand <substring>                   full bodies for matches only
             --access <level> --spi any|none|<group> --doc --numbers
             --no-header --limit
+            --budget <bytes>                       deepest rung that fits; outlines end priced
 get         field-selectable read; bare positional resolves one record,
             any of --path/--kind/--container/--name-like/--tag/--spi enumerates
             --fields signature,summary,invariants,ownership,dependencies,
@@ -1310,6 +1345,7 @@ get         field-selectable read; bare positional resolves one record,
 clip        write-only: --paste-replacing <decl_id/name> (--file to disambiguate)
 query       read-only SELECT/WITH/PRAGMA
 stats       project shape (--section, --top, --since, --window, --format, <path>)
+skill       the embedded agent skill, stamped: print | --write <skills dir> | --zip <file>
 weave       Markdown literate projection (--summary, --section, --access, --spi)
 imports     import lines + their @_spi groups (--module, --spi, --testable)
 file        sandbox-escape read/write/append/log

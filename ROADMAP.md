@@ -477,13 +477,20 @@ generated tool list, check no profile's text names a tool outside it, and cap
 the size (~1.6 KB for `nav`). The test-asserted-resource route was taken over
 generating from `SKILL.md`; the long form still has to be kept in step by hand.
 
-**Follow-ons, now unblocked.** `code-monkey skill [--write <dir>]` prints or
-places the full `SKILL.md` from the same embedded resource with a version
-stamp, and `doctor` warns when a skill it can find (`~/.claude/skills`,
-`.claude/skills`) carries an older stamp than the binary. Account-synced skills
-(claude.ai, Desktop) can't be written locally; `skill --zip` produces the upload
-bundle instead. Without the `doctor` check this is just a faster way to make
-stale copies.
+**Follow-ons — done** (2026-11-19). `code-monkey skill` prints the embedded
+SKILL.md stamped with `code-monkey-version` and `code-monkey-digest` in its
+frontmatter `metadata`; `--write <dir>` installs it, refusing to replace another
+skill; `--zip` writes the claude.ai upload bundle (a hand-written stored zip, so
+no subprocess). `doctor` checks `~/.claude/skills`, the project's
+`.claude/skills` and the desktop app's synced account skills.
+
+Two departures from the plan. The text is embedded as a Makefile-generated
+`SkillText.swift`, not a SwiftPM resource: a resource bundle stays behind in
+`.build` when `make install` copies the binary. And `doctor` compares by
+content, not by stamp — an older stamp would also have flagged every rebuild,
+and comparing text catches hand-pasted, unstamped copies, which is exactly what
+the stale account skill was. A test fails when `SkillText.swift` and SKILL.md
+disagree. `skill` is excluded from the MCP tool list.
 
 ---
 

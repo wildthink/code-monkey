@@ -17,8 +17,10 @@ struct ToolPolicy: Sendable {
     }
 
     /// Not commands: `repl` is an interactive shell, which an MCP client can never drive, and
-    /// `help` is ArgumentParser's own.
-    let excludedCommands: Set<String> = ["repl", "help"]
+    /// `help` is ArgumentParser's own. `skill` installs the rules an agent would read *before*
+    /// connecting — the server already sends their short form in `instructions` — and writes
+    /// outside the project, so its schema would cost every turn and serve no call.
+    let excludedCommands: Set<String> = ["repl", "help", "skill"]
 
     /// `--json` is the server's business, not the client's — every tool that emits structured
     /// output gets it injected below, and offering it as a parameter only invites turning it off.
