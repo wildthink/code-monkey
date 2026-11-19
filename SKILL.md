@@ -34,6 +34,9 @@ below describes the behavior once.
    - Naming is `code_monkey_<subcommand>`; a command that only groups
      subcommands expands to its children, so `file read` is
      `code_monkey_file_read`.
+   - The server sends a short form of these rules as its MCP `instructions`,
+     built for the active profile, so a client that honours the field has the
+     orientation order before the first call.
    - `repl` and `help` are never exposed. `--json` is injected by the server
      and is not a parameter you can set.
    - The server may advertise a *profile* rather than the whole surface:
@@ -88,7 +91,8 @@ substitutes. Cheapest useful order (sizes measured on this repo):
 3. `stats --section mass` — which files hold the declarations, ~600 B. Add
    `--section hotspots` for long bodies and undocumented high-fan-in names.
    Full `stats` is ~4.5 KB; ask for sections.
-4. `code <file-or-Type> -L0 --doc` aimed at what steps 2–3 surfaced.
+4. `code <file-or-Type> -L0 --doc` aimed at what steps 2–3 surfaced. Its last
+   line prices the next rungs; or pass `--budget <bytes>` instead of `-L`.
 5. `code <Type> --expand <member>` for one body in context.
 6. Before an edit: `get <id>` for directives, `calls <id> --summary` for blast radius.
 
@@ -284,6 +288,21 @@ context — `:member` hides the siblings it filters past, so that costs a second
 call for the outline. `--expand` implies `-L2`, forces its match in even below
 the rung that would have listed it, and is inherited by anything nested inside
 a matched type. An explicit `--access`/`--spi` floor still outranks it.
+
+**Every outline is priced.** The last line says what the rungs above would
+cost — `// next: -L1 = 2.2 KB, -L2 = 3.1 KB, -L3 ≈ 21.8 KB` — and `--json`
+carries the same figures as `ladder`. Read it before descending; a rung that
+costs ten times the one you are on is a reason to aim `--expand` instead.
+`-L3` is estimated (`≈`) from declaration lengths, within a few percent.
+
+```bash
+code-monkey code Walker --budget 4000   # deepest rung whose outline fits in 4 KB
+```
+
+`--budget` names the rung it chose and what the next one would cost, renders
+rung 0 with an "over budget" note when nothing fits, and never drops
+declarations to fit (`--limit` does that, and says so). An explicit `-L` wins
+over it; the kind flags, `--body` and `--fold` step off the ladder and refuse it.
 
 `code --fold --expand X` is the outline twin of `get X --fields body
 --body-mode fold --keep X`. Use `code` for the synthetic uniform view, `get`
@@ -614,6 +633,7 @@ get         field-selectable read; bare positional resolves one record,
 code        readable Swift outlines at a chosen rung of disclosure
             selector: Name | Name:member | file | directory | . (whole project)
             -L0..3                      shell | +properties | +signatures | +bodies
+            --budget <bytes>            deepest rung that fits; every outline ends priced
             --expand <substring>        full bodies for matches, rest at --level
             --vars/--funcs/--types/--cases/--all   exact slice instead of a rung
             --body/--fold --access <level> --spi any|none|<group> --doc --numbers

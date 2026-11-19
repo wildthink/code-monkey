@@ -434,7 +434,7 @@ or delete it.
 
 ---
 
-## 7. MCP server `instructions` — the reading rules ride the handshake
+## 7. MCP server `instructions` — the reading rules ride the handshake — **done** (2026-11-19)
 
 Written 2026-11-19, after a review found three copies of the agent rules — the
 repo `SKILL.md`, a claude.ai account skill, and a `~/.claude/CLAUDE.md` recipe —
@@ -470,7 +470,14 @@ build stamps and have a test assert every command it names exists in the
 command tree. The second is cheaper and catches the exact failure that
 prompted this item.
 
-**Follow-ons, only if 7 lands.** `code-monkey skill [--write <dir>]` prints or
+**As built.** `ServerInstructions.swift` holds the steps as data (tool, argument
+keys, text) and assembles the text per profile, dropping any step whose tool the
+profile doesn't advertise. Tests hold every named tool and argument to the
+generated tool list, check no profile's text names a tool outside it, and cap
+the size (~1.6 KB for `nav`). The test-asserted-resource route was taken over
+generating from `SKILL.md`; the long form still has to be kept in step by hand.
+
+**Follow-ons, now unblocked.** `code-monkey skill [--write <dir>]` prints or
 places the full `SKILL.md` from the same embedded resource with a version
 stamp, and `doctor` warns when a skill it can find (`~/.claude/skills`,
 `.claude/skills`) carries an older stamp than the binary. Account-synced skills
@@ -480,7 +487,7 @@ stale copies.
 
 ---
 
-## 8. `code --budget` — price the rung before paying for it
+## 8. `code --budget` — price the rung before paying for it — **done** (2026-11-19)
 
 Written 2026-11-19, from `file log --stats` over 347 invocations. `code` is the
 most-read command after `index`, and the **re-reads** section is almost
@@ -514,6 +521,16 @@ and `--budget` lets the skill say "spend at most N" instead of teaching rung
 semantics an agent then misjudges. It is also measurable after the fact: the
 re-reads section of `--stats` should shrink, and if it doesn't, the trailer
 isn't being read.
+
+**As built.** Both halves. `Shaper` now owns forest shaping and text so every
+rung is measured by the code path that prints the chosen one. L0–L2 render in
+memory; L3 is L2 plus each newly-sliced leaf's `decl_length` less the stub it
+replaces — within 1% on this repo's types and on the whole project (479.2 KB
+estimated, 478.9 KB actual). Whole-project `code` with the trailer runs in
+~70 ms debug. One deviation from the plan above: `--expand` isn't paid first
+as a separate step — its matches render in full on every rung, so they are in
+every rung's price already. `-L` given with `--budget` wins and the trailer
+says the budget was ignored; kind flags, `--body`, `--fold` reject it.
 
 **The trap.** Estimates that lie. Byte counts must come from the same renderer
 with the same flags (`--doc`, `--access`, `--spi`, `--limit`), or the trailer

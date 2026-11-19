@@ -171,7 +171,9 @@ struct CodeCmd: AsyncParsableCommand {
 
         Cost climbs steeply with the rung: level 1 carries every property, and with `--doc` \
         every leading doc comment and directive besides. Stay at 0 until you know which type \
-        you want, then descend on that one alone.
+        you want, then descend on that one alone. Every outline ends with what the next rungs \
+        would cost (`ladder` in JSON), so the descent is a choice rather than a guess; \
+        `--budget <bytes>` makes it for you, picking the deepest rung that fits.
 
         `--expand` lifts one member above the rung: matches get full bodies, everything else \
         stays where `--level` put it. That is the read a `:member` filter cannot express, \
@@ -187,6 +189,7 @@ struct CodeCmd: AsyncParsableCommand {
           code-monkey code Walk:enum --funcs --body    ...with bodies expanded
           code-monkey code Walker --expand isEx    one body, its siblings as signatures
           code-monkey code Walker -L0 --expand isEx    ...without the siblings
+          code-monkey code Walker --budget 4000    the deepest rung under 4 KB
           code-monkey code Sources/foo.swift -L2   outline every decl in one file
           code-monkey code . --types               every type in the project, one shell each
           code-monkey code Walker --funcs --access public    the public call surface
@@ -223,6 +226,11 @@ struct CodeCmd: AsyncParsableCommand {
     @Flag(name: .long, help: "Annotate each decl with its line range.") var numbers: Bool = false
     @Flag(name: .long, help: "Omit the `// path` provenance comments.") var noHeader: Bool = false
     @Option(name: .long, help: "Cap the number of top-level decls rendered.") var limit: Int = 200
+    @Option(name: .long, help: """
+        Pick the deepest rung whose outline fits in this many bytes, and say which. Ignored when \
+        -L is given; cannot combine with the kind flags, --body or --fold.
+        """)
+    var budget: Int?
     @Option(name: .long, help: "Syntax coloring: auto (only at a terminal, honoring NO_COLOR) | always | never.")
     var color: ColorMode = .auto
 
@@ -231,6 +239,21 @@ struct CodeCmd: AsyncParsableCommand {
     mutating func run() async throws {
         guard level == nil || (0...Ladder.max).contains(level!) else {
             FileHandle.standardError.write(Data("--level out of range: expected 0...\(Ladder.max)\n".utf8))
+            throw ExitCode(1)
+        }
+        if let budget, budget <= 0 {
+            FileHandle.standardError.write(Data("--budget must be a positive byte count\n".utf8))
+            throw ExitCode(1)
+        }
+        let explicitKinds = kindFilter()
+        // The ladder is in play only when nothing overrides it: a kind flag picks an exact slice
+        // and `--body`/`--fold` pick a depth, so neither has a "next rung" to price.
+        let ladderInPlay = explicitKinds == nil && !body && !fold
+        if budget != nil, !ladderInPlay {
+            FileHandle.standardError.write(Data("""
+                --budget picks a rung of the ladder; it cannot combine with --vars/--funcs/\
+                --types/--cases/--all, --body or --fold, which step off it\n
+                """.utf8))
             throw ExitCode(1)
         }
         let allowedAccess = access.map { Set(AccessLevel.atOrAbove($0)) }
@@ -244,54 +267,96 @@ struct CodeCmd: AsyncParsableCommand {
         // `--body` bumps for the plainest reason of the three: rung 0 shows no members, so
         // `code Renderer --body` answered `struct Renderer {}` — a request for bodies, granted
         // with none. Whoever types it has asked for the cost.
-        let effectiveLevel = level ?? (sel.member != nil || expand != nil || body ? 2 : 0)
-        let rung = Ladder.rung(effectiveLevel)
+        let defaultLevel = level ?? (sel.member != nil || expand != nil || body ? 2 : 0)
 
-        let explicitKinds = kindFilter()
-        let memberKinds = explicitKinds ?? rung.members
-        let depth: BodyDepth = body ? .full : (fold ? .fold : (explicitKinds != nil ? .stub : rung.depth))
+        func renderer(at lvl: Int) -> Renderer {
+            let rung = Ladder.rung(lvl)
+            let depth: BodyDepth = body ? .full : (fold ? .fold : (explicitKinds != nil ? .stub : rung.depth))
+            return Renderer(project: project, memberKinds: explicitKinds ?? rung.members,
+                            rootKinds: explicitKinds, depth: depth, expand: expand,
+                            nameFilter: sel.member, allowedAccess: allowedAccess,
+                            spiFilter: spi, annotations: [:], numbers: numbers)
+        }
 
         let rootRows = try await resolveRoots(sel: sel, db: db, project: project)
         guard !rootRows.isEmpty else {
             FileHandle.standardError.write(Data("no decl matches: \(selector ?? "(project)")\n".utf8))
             throw ExitCode(1)
         }
+        let assembled = try await assemble(roots: rootRows, db: db)
+        let shaper = Shaper(namesARoot: sel.namesARoot, pathSelected: sel.path != nil, limit: limit,
+                            noHeader: noHeader)
 
-        var renderer = Renderer(project: project, memberKinds: memberKinds, rootKinds: explicitKinds,
-                                depth: depth, expand: expand, nameFilter: sel.member,
-                                allowedAccess: allowedAccess,
-                                spiFilter: spi, annotations: [:], numbers: numbers)
+        // Which rungs get rendered. The chosen one always; with the ladder in play, every rung
+        // below 3 above it too (or all of them, when `--budget` is choosing), so the trailer can
+        // quote what the next read costs. Rung 3 is estimated rather than rendered: it is the
+        // only one that slices source from disk, and the one an estimate saves the most on.
+        let budgetChooses = budget != nil && level == nil
+        let measured: [Int] = if !ladderInPlay || defaultLevel == 3 { [defaultLevel] }
+            else if budgetChooses { [0, 1, 2] }
+            else { Array(defaultLevel...2) }
+        var renderers = Dictionary(uniqueKeysWithValues: measured.map { ($0, renderer(at: $0)) })
+        let shaped = renderers.mapValues { shaper.shape(assembled, renderer: $0) }
 
-        var forest = try await assemble(roots: rootRows, db: db)
-        // A root the user named is always shown — the filters describe its *members*. A root that
-        // merely turned up in a path or project sweep is filtered too, which is what makes
-        // `code . --types` a type listing and `code src:fold` a name search. Note this uses
-        // `includeRoot`, not `include`: a rung's member set says what to show *inside* a
-        // declaration and must never decide whether the declaration itself is listed.
-        if !sel.namesARoot { forest = forest.filter(renderer.includeRoot) }
-
-        // Test code sinks to the end, with the seam labelled. Across a package it is a fifth
-        // to a quarter of the declarations and, in a map of the whole project, almost never
-        // what the reader came for — but almost never is not never, so this orders and labels
-        // rather than omits. Ordering also decides who spends the `--limit` budget: production
-        // first. A path selector is left alone; pointing at `Tests/` already said what you want.
-        //# ai:invariant: reorders only — every decl that passed the filters still renders
-        let testCount = sel.path == nil ? CodeCmd.sinkTests(&forest) : 0
-
-        let matched = forest.count
-        let truncated = matched > limit
-        forest = Array(forest.prefix(limit))
-        guard !forest.isEmpty else {
+        guard let first = shaped[measured[0]], !first.forest.isEmpty else {
             FileHandle.standardError.write(Data("no decl matches those filters\n".utf8))
             throw ExitCode(1)
         }
-        if doc { renderer.annotations = try await loadAnnotations(forest: forest, db: db) }
+        if doc {
+            let annotations = try await loadAnnotations(forest: shaped.values.flatMap(\.forest), db: db)
+            for key in renderers.keys { renderers[key]!.annotations = annotations }
+        }
 
         // Only the leaves that render in full are sliced from disk, so only their files need to
         // still match the index. A shell-level outline reads entirely from the index and stays
-        // available even when the working tree has moved on.
-        let sliced = forest.flatMap { renderer.expandedLeaves($0) }.map(\.file)
-        try await SourceFreshness.require(sliced, project: project, db: db)
+        // available even when the working tree has moved on. Below rung 3 those leaves are the
+        // `--expand` matches, the same set on every rung, so measuring adds no new files.
+        var checked: Set<String> = []
+        func requireFresh(_ lvl: Int) async throws {
+            guard let r = renderers[lvl], let s = shaped[lvl] else { return }
+            let files = Set(s.forest.flatMap { r.expandedLeaves($0) }.map(\.file)).subtracting(checked)
+            try await SourceFreshness.require(Array(files).sorted(), project: project, db: db)
+            checked.formUnion(files)
+        }
+        for lvl in measured { try await requireFresh(lvl) }
+
+        var costs: [RungCost] = []
+        if ladderInPlay {
+            for lvl in measured where lvl < 3 {
+                let text = shaper.text(shaped[lvl]!, renderer: renderers[lvl]!)
+                costs.append(RungCost(level: lvl, bytes: text.utf8.count, estimated: false))
+            }
+            if let l2 = costs.first(where: { $0.level == 2 }), defaultLevel < 3 {
+                costs.append(RungCost(level: 3, bytes: l2.bytes + rungThreeExtra(shaped[2]!, l2: renderers[2]!,
+                                                                                  l3: renderer(at: 3)),
+                                      estimated: true))
+            }
+        }
+
+        var chosen = defaultLevel
+        if budgetChooses, let budget {
+            chosen = LadderReport.choose(costs, budget: budget)
+            if chosen == 3 {
+                renderers[3] = renderer(at: 3)
+                if doc { renderers[3]!.annotations = renderers[2]!.annotations }
+            }
+        }
+        let renderer = renderers[chosen]!
+        let result = shaped[chosen] ?? shaper.shape(assembled, renderer: renderer)
+        if shaped[chosen] == nil {
+            // Only a budget that chose the estimated rung lands here; its bodies come off disk.
+            let files = Set(result.forest.flatMap { renderer.expandedLeaves($0) }.map(\.file)).subtracting(checked)
+            try await SourceFreshness.require(Array(files).sorted(), project: project, db: db)
+        }
+        let forest = result.forest
+
+        let ladder: LadderReport? = ladderInPlay ? LadderReport(
+            level: chosen,
+            bytes: costs.first(where: { $0.level == chosen })?.bytes,
+            bytesEstimated: costs.first(where: { $0.level == chosen })?.estimated ?? false,
+            next: costs.filter { $0.level > chosen },
+            budget: budget,
+            budgetIgnored: budget != nil && level != nil) : nil
 
         // Resolved before either output path branches, so `--json` and the outline agree.
         let peeked = peek ? try await peekTypes(forest: forest, renderer: renderer, db: db) : []
@@ -314,39 +379,12 @@ struct CodeCmd: AsyncParsableCommand {
                          is_test: node.isTest, peeked: true,
                          code: peekRenderer.render(node, indent: 0).joined(separator: "\n"))
             }
-            Printer.emit(payload, json: true, tier: "code", resultCount: payload.count) { "" }
+            Printer.emit(payload, json: true, tier: "code", resultCount: payload.count,
+                         ladder: ladder) { "" }
             return
         }
 
-        // A seam is worth drawing only with production on one side and tests still on the
-        // other. `--limit` can cut into the test block after they sank, so the label counts
-        // what survived the truncation rather than what moved.
-        // `--no-header` is decoration off, so the seam goes with the provenance comments. The
-        // truncation note below stays: that one warns that output is incomplete, which is not
-        // decoration and is never the thing a caller meant to silence.
-        let firstTest = matched - testCount
-        let seam = (!noHeader && testCount > 0 && firstTest > 0 && firstTest < forest.count)
-            ? firstTest : nil
-        let shownTests = seam.map { forest.count - $0 } ?? 0
-
-        var out: [String] = []
-        var lastFile = ""
-        for (i, node) in forest.enumerated() {
-            if let seam, i == seam {
-                out.append("")
-                out.append("// ── production map ends here — \(shownTests) test "
-                           + "decl\(shownTests == 1 ? "" : "s") follow")
-                lastFile = ""   // re-print the file header on the far side of the seam
-            }
-            if !noHeader, node.file != lastFile {
-                if !out.isEmpty { out.append("") }
-                out.append("// ── \(node.file)")
-                lastFile = node.file
-            } else if !out.isEmpty {
-                out.append("")
-            }
-            out.append(contentsOf: renderer.render(node, indent: 0))
-        }
+        var out = [shaper.text(result, renderer: renderer)]
         if !peeked.isEmpty {
             out.append("")
             if !noHeader { out.append("// ── types named above, shape only") }
@@ -355,9 +393,27 @@ struct CodeCmd: AsyncParsableCommand {
                 out.append(contentsOf: peekRenderer.render(node, indent: 0))
             }
         }
-        if truncated { out.append("\n// +\(matched - limit) more — raise --limit or narrow the selector") }
+        if result.truncated { out.append("\n// +\(result.matched - limit) more — raise --limit or narrow the selector") }
+        // The trailer is decoration unless a budget was given: then it reports a choice the
+        // caller delegated, which `--no-header` was never asked to hide.
+        if let ladder, let line = ladder.trailer, !noHeader || budget != nil { out.append("\n" + line) }
         let text = out.joined(separator: "\n")
         print(color.enabled() ? Highlighter.colorize(text) : text)
+    }
+
+    /// Bytes rung 3 adds over rung 2: every leaf it slices in full that rung 2 left as a header,
+    /// less the header it replaces. Still a slight overestimate — the slice keeps the source's
+    /// attributes and spacing — which errs the safe way for a budget.
+    //# ai:why: rung 3 is the one rung that reads source from disk; estimating it keeps a cost
+    //# ai:why: preview from paying for the very bodies it exists to warn about
+    private func rungThreeExtra(_ shaped: Shaper.Shaped, l2: Renderer, l3: Renderer) -> Int {
+        let already = Set(shaped.forest.flatMap { l2.expandedLeaves($0) }.map(\.rowId))
+        return shaped.forest.flatMap { l3.expandedLeaves($0) }
+            .filter { !already.contains($0.rowId) }
+            .reduce(0) { total, leaf in
+                let stub = l2.render(leaf, indent: 0).joined(separator: "\n").utf8.count
+                return total + Swift.max(0, leaf.declLength - stub)
+            }
     }
 
     /// Moves test decls to the end, preserving the order within each group, and returns how
@@ -550,6 +606,132 @@ struct CodeView: Encodable {
     /// Set on the shells `--peek` added for context; they were not selected by the query.
     var peeked: Bool = false
     var code: String
+}
+
+// MARK: - Ladder costs
+
+/// What one rung's outline costs, in UTF-8 bytes of the plain (uncolored) text.
+struct RungCost: Encodable, Sendable {
+    let level: Int
+    let bytes: Int
+    /// Rung 3 is priced from declaration lengths, not rendered; see `rungThreeExtra`.
+    let estimated: Bool
+}
+
+/// The ladder, priced — `ladder` in the JSON envelope, and the outline's last line.
+//# ai:invariant: every figure comes from the same renderer, filters and --limit as the output
+//# ai:invariant: a budget never drops declarations to fit — truncation is --limit's job
+struct LadderReport: Encodable, Sendable {
+    let level: Int
+    let bytes: Int?
+    let bytesEstimated: Bool
+    let next: [RungCost]
+    let budget: Int?
+    let budgetIgnored: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case level, bytes, next, budget
+        case budgetIgnored = "budget_ignored"
+        case bytesEstimated = "bytes_estimated"
+    }
+
+    /// The deepest rung that fits, or rung 0 when none does — an over-budget map still beats
+    /// no map, and the trailer says it is over.
+    static func choose(_ costs: [RungCost], budget: Int) -> Int {
+        costs.filter { $0.bytes <= budget }.map(\.level).max() ?? 0
+    }
+
+    static func size(_ bytes: Int) -> String {
+        bytes < 1000 ? "\(bytes) B" : String(format: "%.1f KB", Double(bytes) / 1000)
+    }
+
+    var trailer: String? {
+        let rungs = next.map { "-L\($0.level) \($0.estimated ? "≈" : "=") \(Self.size($0.bytes))" }
+        let nextPart = rungs.isEmpty ? nil : "next: " + rungs.joined(separator: ", ")
+        var parts: [String] = []
+        if let budget {
+            if budgetIgnored {
+                parts.append("--budget ignored: -L\(level) was given")
+            } else if let bytes, bytes > budget {
+                parts.append("budget \(Self.size(budget)) → -L\(level) (\(Self.size(bytes)), "
+                             + "over budget — narrow the selector)")
+            } else {
+                parts.append("budget \(Self.size(budget)) → -L\(level)"
+                             + (bytes.map { " (\(bytesEstimated ? "≈ " : "")\(Self.size($0)))" } ?? ""))
+            }
+        }
+        if let nextPart { parts.append(nextPart) }
+        return parts.isEmpty ? nil : "// " + parts.joined(separator: "; ")
+    }
+}
+
+/// The part of `code`'s output that depends on the rung: which roots survive, in what order,
+/// and the text they render to. Pulled out of `run` so every rung is shaped and measured by the
+/// one code path that also prints the chosen one.
+struct Shaper {
+    let namesARoot: Bool
+    let pathSelected: Bool
+    let limit: Int
+    let noHeader: Bool
+
+    struct Shaped {
+        let forest: [CodeNode]
+        let matched: Int
+        let testCount: Int
+        var truncated: Bool { matched > forest.count }
+    }
+
+    func shape(_ assembled: [CodeNode], renderer: Renderer) -> Shaped {
+        var forest = assembled
+        // A root the user named is always shown — the filters describe its *members*. A root that
+        // merely turned up in a path or project sweep is filtered too, which is what makes
+        // `code . --types` a type listing and `code src:fold` a name search. Note this uses
+        // `includeRoot`, not `include`: a rung's member set says what to show *inside* a
+        // declaration and must never decide whether the declaration itself is listed.
+        if !namesARoot { forest = forest.filter(renderer.includeRoot) }
+
+        // Test code sinks to the end, with the seam labelled. Across a package it is a fifth
+        // to a quarter of the declarations and, in a map of the whole project, almost never
+        // what the reader came for — but almost never is not never, so this orders and labels
+        // rather than omits. Ordering also decides who spends the `--limit` budget: production
+        // first. A path selector is left alone; pointing at `Tests/` already said what you want.
+        //# ai:invariant: reorders only — every decl that passed the filters still renders
+        let testCount = pathSelected ? 0 : CodeCmd.sinkTests(&forest)
+        let matched = forest.count
+        return Shaped(forest: Array(forest.prefix(limit)), matched: matched, testCount: testCount)
+    }
+
+    func text(_ shaped: Shaped, renderer: Renderer) -> String {
+        // A seam is worth drawing only with production on one side and tests still on the
+        // other. `--limit` can cut into the test block after they sank, so the label counts
+        // what survived the truncation rather than what moved.
+        // `--no-header` is decoration off, so the seam goes with the provenance comments.
+        let forest = shaped.forest
+        let firstTest = shaped.matched - shaped.testCount
+        let seam = (!noHeader && shaped.testCount > 0 && firstTest > 0 && firstTest < forest.count)
+            ? firstTest : nil
+        let shownTests = seam.map { forest.count - $0 } ?? 0
+
+        var out: [String] = []
+        var lastFile = ""
+        for (i, node) in forest.enumerated() {
+            if let seam, i == seam {
+                out.append("")
+                out.append("// ── production map ends here — \(shownTests) test "
+                           + "decl\(shownTests == 1 ? "" : "s") follow")
+                lastFile = ""   // re-print the file header on the far side of the seam
+            }
+            if !noHeader, node.file != lastFile {
+                if !out.isEmpty { out.append("") }
+                out.append("// ── \(node.file)")
+                lastFile = node.file
+            } else if !out.isEmpty {
+                out.append("")
+            }
+            out.append(contentsOf: renderer.render(node, indent: 0))
+        }
+        return out.joined(separator: "\n")
+    }
 }
 
 // MARK: - Renderer

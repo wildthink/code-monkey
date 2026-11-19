@@ -258,6 +258,68 @@ struct CodeTests {
         #expect(forest.filter(rung1.includeRoot).map(\.name) == ["NoProperties", "freeFunction"])
     }
 
+    // MARK: ladder costs
+
+    private static func ladderForest() -> [CodeNode] {
+        CodeNode.buildForest([
+            Self.row(1, "struct", "Box", "struct Box", offset: 0, length: 200),
+            Self.row(2, "var", "count", "var count: Int", offset: 10, length: 20),
+            Self.row(3, "func", "grow", "func grow()", offset: 40, length: 60, body: (52, 48)),
+            Self.row(4, "func", "free", "func free()", offset: 210, length: 40, body: (222, 28)),
+        ])
+    }
+
+    /// Each rung shows a superset of the one below, so its outline can only grow — which is what
+    /// makes "the deepest rung that fits" a meaningful thing for `--budget` to search for.
+    @Test func everyRungCostsAtLeastTheOneBelow() {
+        let shaper = Shaper(namesARoot: false, pathSelected: true, limit: 200, noHeader: false)
+        let forest = Self.ladderForest()
+        let bytes = (0...2).map { lvl -> Int in
+            let r = Self.renderer(members: Ladder.rung(lvl).members)
+            return shaper.text(shaper.shape(forest, renderer: r), renderer: r).utf8.count
+        }
+        #expect(bytes[0] < bytes[1])
+        #expect(bytes[1] < bytes[2])
+    }
+
+    @Test func aBudgetPicksTheDeepestRungThatFits() {
+        let costs = [RungCost(level: 0, bytes: 100, estimated: false),
+                     RungCost(level: 1, bytes: 400, estimated: false),
+                     RungCost(level: 2, bytes: 900, estimated: false),
+                     RungCost(level: 3, bytes: 9_000, estimated: true)]
+        #expect(LadderReport.choose(costs, budget: 1_000) == 2)
+        #expect(LadderReport.choose(costs, budget: 400) == 1)
+        #expect(LadderReport.choose(costs, budget: 50_000) == 3)
+        // Nothing fits: the map is still worth more than nothing, and the trailer says so.
+        #expect(LadderReport.choose(costs, budget: 10) == 0)
+    }
+
+    @Test func theTrailerPricesOnlyTheRungsAbove() {
+        let report = LadderReport(level: 1, bytes: 400, bytesEstimated: false,
+                                  next: [RungCost(level: 2, bytes: 900, estimated: false),
+                                         RungCost(level: 3, bytes: 9_000, estimated: true)],
+                                  budget: nil, budgetIgnored: false)
+        #expect(report.trailer == "// next: -L2 = 900 B, -L3 ≈ 9.0 KB")
+        let top = LadderReport(level: 3, bytes: nil, bytesEstimated: false, next: [],
+                               budget: nil, budgetIgnored: false)
+        #expect(top.trailer == nil)
+    }
+
+    @Test func theTrailerReportsWhatTheBudgetDid() {
+        let fits = LadderReport(level: 2, bytes: 900, bytesEstimated: false, next: [],
+                                budget: 1_000, budgetIgnored: false)
+        #expect(fits.trailer == "// budget 1.0 KB → -L2 (900 B)")
+        let over = LadderReport(level: 0, bytes: 6_400, bytesEstimated: false, next: [],
+                                budget: 1_000, budgetIgnored: false)
+        #expect(over.trailer?.contains("over budget") == true)
+        let ignored = LadderReport(level: 1, bytes: 400, bytesEstimated: false, next: [],
+                                   budget: 1_000, budgetIgnored: true)
+        #expect(ignored.trailer == "// --budget ignored: -L1 was given")
+        let estimated = LadderReport(level: 3, bytes: 9_000, bytesEstimated: true, next: [],
+                                     budget: 50_000, budgetIgnored: false)
+        #expect(estimated.trailer == "// budget 50.0 KB → -L3 (≈ 9.0 KB)")
+    }
+
     @Test func anExplicitKindFlagStillFiltersRoots() {
         let forest = CodeNode.buildForest([
             Self.row(1, "struct", "Thing", "struct Thing", offset: 0, length: 100),
@@ -1465,6 +1527,49 @@ struct BridgeTests {
         #expect(get["deep"]?.objectValue?["type"]?.stringValue == "boolean")
         let code = try Self.schema("code_monkey_code")
         #expect(code["level"]?.objectValue?["type"]?.stringValue == "integer")
+    }
+
+    @Test func budgetIsTypedAsAnInteger() throws {
+        let code = try Self.schema("code_monkey_code")
+        #expect(code["budget"]?.objectValue?["type"]?.stringValue == "integer")
+    }
+
+    // MARK: instructions
+
+    /// The instructions are prompt text an agent acts on before its first call, so a tool or
+    /// argument they name that the server does not have is a guaranteed failed call.
+    @Test func instructionsNameOnlyRealToolsAndArguments() throws {
+        let tools = try Self.bridge().tools()
+        let byName = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
+        for step in ServerInstructions.orientation + [ServerInstructions.editing] {
+            let tool = try #require(byName[step.tool], "instructions name \(step.tool)")
+            let properties = tool.inputSchema.objectValue?["properties"]?.objectValue ?? [:]
+            for argument in step.arguments {
+                #expect(properties[argument] != nil, "\(step.tool) has no argument \(argument)")
+            }
+        }
+        let all = ServerInstructions.text(profile: "all", tools: Set(byName.keys))
+        #expect(ServerInstructions.mentionedTools(in: all).isSubset(of: Set(byName.keys)))
+    }
+
+    @Test func instructionsNeverNameAToolOutsideTheProfile() throws {
+        let bridge = try Self.bridge()
+        let all = bridge.tools()
+        for profile in ToolPolicy.Profile.allNames {
+            let advertised = Set(try #require(bridge.policy.tools(all, profile: profile)).map(\.name))
+            let text = ServerInstructions.text(profile: profile, tools: advertised)
+            let stray = ServerInstructions.mentionedTools(in: text).subtracting(advertised)
+            #expect(stray.isEmpty, "profile \(profile) instructions name \(stray.sorted())")
+            #expect(text.contains("Tool profile: \(profile)"))
+        }
+    }
+
+    /// Every tool schema is paid for on every turn; the instructions are paid for once, but still
+    /// belong to the token-economy argument this tool makes. Roughly 4 bytes a token.
+    @Test func instructionsStayShort() throws {
+        let tools = Set(try Self.bridge().tools().map(\.name))
+        let text = ServerInstructions.text(profile: "all", tools: tools)
+        #expect(text.utf8.count < 2_600, "instructions grew to \(text.utf8.count) bytes")
     }
 
     /// Flags the server drives itself must not be offered to the client.

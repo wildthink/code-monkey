@@ -47,6 +47,8 @@ enum Printer {
         let warnings: [String]
         let freshness: String?
         var fields: [String]? = nil
+        /// `code` only: what this rung cost and what the next ones would. Absent elsewhere.
+        var ladder: LadderReport? = nil
         let data: T
     }
 
@@ -58,6 +60,7 @@ enum Printer {
         warnings: [String] = [],
         freshness: String? = nil,
         fields: [String]? = nil,
+        ladder: LadderReport? = nil,
         text: () -> String
     ) {
         if json {
@@ -71,6 +74,7 @@ enum Printer {
                 warnings: warnings,
                 freshness: freshness,
                 fields: fields,
+                ladder: ladder,
                 data: value
             )
             if let d = try? enc.encode(envelope), let s = String(data: d, encoding: .utf8) {

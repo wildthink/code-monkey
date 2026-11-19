@@ -54,6 +54,7 @@ struct CodeMonkeyMCP: AsyncParsableCommand {
         let server = Server(
             name: "code-monkey",
             version: "0.1.0",
+            instructions: ServerInstructions.text(profile: profile, tools: Set(tools.map(\.name))),
             capabilities: .init(tools: .init(listChanged: false)))
 
         await server.withMethodHandler(ListTools.self) { _ in .init(tools: tools) }

@@ -30,7 +30,7 @@ struct ToolPolicy: Sendable {
     /// cannot be closed by reading harder.
     //# ai:invariant: every `Int`/`Int?` option in the CLI appears here, or it types as a string
     let integerArguments: Set<String> = [
-        "limit", "offset", "depth", "level", "last", "top", "window", "buckets",
+        "limit", "offset", "depth", "level", "last", "top", "window", "buckets", "budget",
     ]
 
     /// Options whose single string holds a comma-separated list. Such a value can never satisfy
