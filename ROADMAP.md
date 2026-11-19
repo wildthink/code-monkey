@@ -434,6 +434,95 @@ or delete it.
 
 ---
 
+## 7. MCP server `instructions` — the reading rules ride the handshake
+
+Written 2026-11-19, after a review found three copies of the agent rules — the
+repo `SKILL.md`, a claude.ai account skill, and a `~/.claude/CLAUDE.md` recipe —
+had drifted. The account skill was two months stale: it advertised `clip`,
+`weave` and `file` as MCP tools and had never heard of `code`, `calls`,
+`imports` or `stats`. Its local copy cannot be fixed in place either; the
+account sync overwrites it.
+
+**What.** Pass `instructions:` to `Server(...)` in `CodeMonkeyMCP.swift:54`. The
+swift-sdk already carries the field (`Server.swift:191`) and returns it in the
+`initialize` result; clients that honour it put it in the agent's context with
+no install step. Content is the short form of `SKILL.md`, ~300 tokens: name the
+project on every call; `doctor` first, `index` only when stale; the orientation
+order (`ai:section` query → `stats --section mass` → `code -L0 --doc` →
+`--expand`); `decl_id` is the handle; directives are guarantees; the table names
+for `query`. It should also name the active `--profile`, so an agent told about
+`clip` doesn't go looking for it on a `nav` server.
+
+**LOE: 2–3 hours**, nearly all of it the text. One golden test on the
+`initialize` response.
+
+**Why it rates above 4b.** 4b ships rules beside the index and still produces a
+second copy. This ships them inside the binary that the rules describe, so they
+cannot be older than the tools they talk about, and they reach every MCP client
+— including ones that read neither `AGENTS.md` nor skills — at the one moment
+the agent is learning the tool surface. It also makes the "which binary am I
+talking to" failure visible: stale rules now mean a stale binary, which
+`doctor` already diagnoses.
+
+**The trap.** Same as 4b's: a hand-written short form drifts from `SKILL.md`.
+Either generate both from one source, or embed the text as a resource the
+build stamps and have a test assert every command it names exists in the
+command tree. The second is cheaper and catches the exact failure that
+prompted this item.
+
+**Follow-ons, only if 7 lands.** `code-monkey skill [--write <dir>]` prints or
+places the full `SKILL.md` from the same embedded resource with a version
+stamp, and `doctor` warns when a skill it can find (`~/.claude/skills`,
+`.claude/skills`) carries an older stamp than the binary. Account-synced skills
+(claude.ai, Desktop) can't be written locally; `skill --zip` produces the upload
+bundle instead. Without the `doctor` check this is just a faster way to make
+stale copies.
+
+---
+
+## 8. `code --budget` — price the rung before paying for it
+
+Written 2026-11-19, from `file log --stats` over 347 invocations. `code` is the
+most-read command after `index`, and the **re-reads** section is almost
+entirely `code` changing rungs on one target — `CodeMonkey` alone accounts for
+five, moving up and down through all four rungs. That is an agent that cannot see what a rung
+costs until it has paid for it, overshooting and backing off. The help text
+says the cost "climbs steeply"; measured here, whole-project `code` is 6 KB at
+L0, 19 KB with `--doc`, 26 KB for `. --types --doc`.
+
+**What.** Two pieces, cheapest first.
+
+- **8a. A cost trailer.** After the outline, one line:
+  `// next: -L1 ≈ 2.1 KB, -L2 ≈ 5.8 KB, -L3 ≈ 31 KB`, and `next_rungs` in the
+  JSON envelope. `get` already does the equivalent for a single target
+  (`doc_lines`, `body_lines`); this extends it to the ladder. L0–L2 are
+  in-memory renders over the forest `run()` has already assembled — `code`'s
+  p50 is 9 ms, so rendering three rungs to count bytes is affordable. L3 slices
+  from disk, so estimate it from `sum(body_length)` instead of rendering.
+- **8b. `--budget <bytes>`.** Pick the deepest rung whose render fits, and say
+  which was chosen and what the next one would have cost. An explicit `-L`
+  still wins. `--expand` matches are paid first and the remainder sets the
+  rung, because the expanded body is the thing that was asked for.
+
+**LOE: 8a half a day, 8b another half.** The renderer is pure and already
+parameterised by rung (`Ladder.rung`), so this is a loop and a byte count, plus
+golden files.
+
+**Why it's worth it.** Every re-read in the log is a whole extra response. A
+trailer that costs one line turns the ladder from trial-and-error into a choice,
+and `--budget` lets the skill say "spend at most N" instead of teaching rung
+semantics an agent then misjudges. It is also measurable after the fact: the
+re-reads section of `--stats` should shrink, and if it doesn't, the trailer
+isn't being read.
+
+**The trap.** Estimates that lie. Byte counts must come from the same renderer
+with the same flags (`--doc`, `--access`, `--spi`, `--limit`), or the trailer
+teaches agents to distrust it. And `--budget` must never silently drop
+declarations to fit — truncation is `--limit`'s job, and it already says when
+it truncates. If L0 alone exceeds the budget, render L0 and say so.
+
+---
+
 ## Smaller things noticed in passing
 
 - **`--argv` does not emit `--project`.** A recorded line replays against
