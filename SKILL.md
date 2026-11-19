@@ -63,7 +63,8 @@ none is injected.
   `.code-monkey.toml` — `Package.swift` above all — is not in the index, so read
   it directly; `query "SELECT path FROM files"` settles which is which. `rg` is
   not banned, it is scoped: see *Neighbours* below.
-- Always `index` before the first read in a session.
+- Run `doctor` before the first read in a session; run `index` only when it
+  reports stale files (or after any edit made outside `clip`/`move`/`rename`).
 - **Always name the project explicitly.** MCP: pass `project` on every call.
   CLI: run inside the project tree, or pass `--project`. An MCP server's default
   root is whatever directory the *host* launched it from, not necessarily the
@@ -72,7 +73,31 @@ none is injected.
 - `decl_id` is the stable handle. Every cheap read returns it. Pass it to heavy reads.
 - Disambiguate by `--file` when multi-match. Don't guess.
 - Tie every command to one explicit uncertainty. Stop when its answer resolves that uncertainty.
-- Report each use: command category, question answered, and why it was cheaper than direct source inspection.
+
+## Orienting in an unfamiliar repo
+
+`query` and `stats` decide *what* to read; `code` reads it. They are not
+substitutes. Cheapest useful order (sizes measured on this repo):
+
+1. `doctor` — provenance, index freshness, project root. ~300 B.
+2. `query "SELECT DISTINCT value FROM directives WHERE tag='ai:section'"` — the
+   author's own architecture map, ~15 rows, ~150 B. Also `WHERE
+   tag='ai:invariant'` for the constraints that must not be broken. No other
+   command lists sections: `code` cannot group by them, and `stats --section
+   docs` only counts them.
+3. `stats --section mass` — which files hold the declarations, ~600 B. Add
+   `--section hotspots` for long bodies and undocumented high-fan-in names.
+   Full `stats` is ~4.5 KB; ask for sections.
+4. `code <file-or-Type> -L0 --doc` aimed at what steps 2–3 surfaced.
+5. `code <Type> --expand <member>` for one body in context.
+6. Before an edit: `get <id>` for directives, `calls <id> --summary` for blast radius.
+
+Bare `code` (whole project at `-L0`) is fine for a small repo (<20 files), but
+it grows with the repo — 6 KB here, 19 KB with `--doc`, 26 KB for
+`code . --types --doc`. `-L1 --doc` costs far more than it looks: every
+property plus every doc comment and directive. Never run `code` on a directory
+after running it on that directory's children; the output overlaps and you pay
+twice.
 
 ## Efficient selection
 
@@ -80,7 +105,7 @@ Start from known context, not mechanically from the cheapest read:
 
 1. Use `fd`, config, manifests, and non-Swift docs for project shape — see
    *Neighbours* below for the split of labour.
-2. Run one `code-monkey index` before Swift semantic reads.
+2. Run `doctor`; `index` only if it reports stale files.
 3. If symbol is known, call `get <decl_id>` directly. Skip filtered enumeration.
 4. If ownership is unknown, run `get` with `--path`/`--kind`/`--container`/`--name-like`/`--tag` to enumerate.
 5. Add `--fields` only for attributes you actually need; omit it for the cheapest locate-only view.
@@ -91,13 +116,10 @@ Start from known context, not mechanically from the cheapest read:
    it is about **files the index doesn't hold**. The index cannot answer either.
 9. Stop using `code-monkey` when setup and lookup cost exceeds direct non-Swift inspection value.
 
-At task end, report calls that produced findings, failed or duplicated calls, and broad source reads avoided.
-
 When developing `code-monkey` itself, use `.build/debug/code-monkey` after
 building.
 
-**Run `code-monkey doctor` first in any session that uses the CLI or the MCP
-server.** More than one repository can build a binary of this name, from
+**Why `doctor` comes first.** More than one repository can build a binary of this name, from
 histories that are not related, and the failure is silent: a tool list that
 disagrees with the CLI, or a schema mismatch. `doctor` reports `built_from`,
 `commit` and `build=#N` for the running executable, for the checkout it is run
@@ -300,10 +322,8 @@ code-monkey index --full                           # rebuild from scratch
 `clip`, `move` and `rename` auto-refresh the touched file. Manual edits require
 a manual `index`.
 
-Read commands open the existing index read-only and do not bootstrap or mutate schema metadata.
-`index` and `clip` retain writable access.
-Database actor owns SQLite handle. Typed `Sendable` rows cross actor boundary.
-Write transactions use `BEGIN IMMEDIATE` and an isolated, non-suspending closure.
+Read commands open the index read-only, so they can run in parallel; only
+`index` and the write surface take a write lock.
 
 `--json` emits envelope fields: `schema_version`, `command`, `tier`,
 `result_count`, `warnings`, `freshness`, and `data`.
@@ -401,14 +421,16 @@ Before editing:
 Anything `get` can't express, run SQL directly:
 
 ```bash
-code-monkey query "SELECT name, file_path FROM declarations d
+code-monkey query "SELECT d.name, f.path FROM declarations d
                      JOIN files f ON f.id=d.file_id
-                    WHERE kind='func' AND container='Database'"
+                    WHERE d.kind='func' AND d.container='Database'"
 ```
 
 Read-only: SELECT/WITH/PRAGMA only.
 
-Schema:
+Schema — use these names; guessing costs a round-trip (`declarations`, not
+`decls`; it has no `path` — join `files` on `file_id`):
+- `meta(key, value)`
 - `files(id, path, mtime, sha256, last_indexed)`
 - `declarations(id, decl_id, file_id, container, container_kind, kind, name,
                 signature, access, spi, modifiers, start_line, end_line,
@@ -416,7 +438,29 @@ Schema:
 - `imports(id, file_id, module, path, kind, spi, testable, line)`
 - `doc_comments(decl_id, text)`
 - `directives(id, decl_id, tag, value, line)`
-- `narrative(id, file_id, kind, path, text)`
+- `call_sites(id, file_id, from_decl, name, receiver, kind, line)`
+- `bindings(id, file_id, from_decl, name, type, line)`
+- `conformances(id, file_id, type_name, protocol_name)`
+- `narrative(id, file_id, kind, path, text)` — often empty; don't budget a call on it
+
+---
+
+## `stats` — project shape before the first read
+
+Answers the standing sizing questions off the index alone. Ask for sections;
+the full report is several KB.
+
+```bash
+code-monkey stats --section mass --top 20      # files worth reading first
+code-monkey stats --section hotspots           # long bodies, undocumented high fan-in
+code-monkey stats --section docs               # coverage, directive tag counts
+code-monkey stats --section delta --since main # per-decl changes on this branch (needs git, fresh index)
+code-monkey stats Sources/Foo                  # narrow to a subtree
+```
+
+Caveats before quoting a figure: `span` nests (a type's span covers its
+members), byte totals count top-level decls only, and `hotspots` fan-in is a
+lower bound (corroborated edges only).
 
 ---
 
@@ -514,31 +558,13 @@ code-monkey file log --last 200 --argv --failed    # only what did not exit 0
 code-monkey file log --last 500 --stats           # how the tool is actually being used
 ```
 
-Every invocation appends one JSONL line carrying the argv it was dispatched with, the
-working directory, `status` (`ok` or `exit <n>`), and `ms`. `--argv` renders those back as
-the command lines that produced them, oldest first — a readable session history, and one you
-can pipe to a shell. The argv is the post-normalization vector, so `-L2` reads back as
-`-L 2` and every recorded line re-parses as written.
-
-`file read/write/append` additionally write a semantic entry naming the path they touched;
-those carry no `argv`, which is how a reader tells the two kinds apart.
-
-`--stats` summarizes the log instead of listing it: per-command counts, failure counts, p50/p90
-latency, and — for `code` and `get` — the distribution of *depths* actually asked for, read off
-argv rather than off the tier a command reports about itself. Two sections are worth acting on.
-**Usage errors** are the argv the parser refused, verbatim: each one is a command whose help
-failed to teach its own spelling. **Re-reads** are the same target read twice inside two
-minutes by different reads (`get shell → code L2`), which is the cheaper tier failing to answer.
-
-`query`'s SQL is replaced with `<sql>` before the line is written, so recording argv does not
-carry query text into the log.
-
-Configure destination with a root-level TOML key such as `audit = ".code-monkey/audit.log"`;
-relative paths resolve from project root. SQL and source bodies are never logged. Without
-configuration, fallback remains `~/.code-monkey/audit.log`.
-
-Concurrent appends use Swift `Mutex`, cross-process `flock`, and `O_APPEND`.
-`code-monkey file log --project <path>` tails configured project log.
+Every invocation appends one JSONL audit line (argv, cwd, status, ms); SQL and
+source bodies are never logged. `--argv` replays the log as command lines;
+`--stats` summarizes it. Two `--stats` sections are worth acting on: **usage
+errors** (a command whose help failed to teach its spelling) and **re-reads**
+(the same target read twice within two minutes — the cheaper tier failed to
+answer). Destination: root-level `audit = "..."` in `.code-monkey.toml`,
+else `~/.code-monkey/audit.log`. GUIDE.md has the format details.
 
 ---
 
@@ -607,8 +633,9 @@ rename      rename a decl: --to <identifier>; refs reported, not rewritten
 query       read-only SQL
 weave       Markdown literate projection
 imports     import lines with their @_spi groups and @testable marks
-stats       project shape: mass, reading cost, docs, hotspots, delta, volatility
             --module <name> --spi any|none|<group> --testable
+stats       project shape: mass, reading cost, docs, hotspots, delta, volatility
+            --section <name> (repeatable) --top N --since <ref> --window <days>
 file        sandbox-escape read/write/append/log
 version     build info
 ```
