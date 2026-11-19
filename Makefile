@@ -1,5 +1,5 @@
 PREFIX ?= $(HOME)/.local/bin
-VERSION ?= 1.1.5
+VERSION ?= 1.1.6
 
 SEQ_FILE := .build-seq
 BUILDINFO := Sources/code-monkey/BuildInfo.swift
